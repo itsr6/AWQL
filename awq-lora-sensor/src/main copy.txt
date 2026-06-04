@@ -1,0 +1,1390 @@
+#include <Arduino.h>
+#include <SPI.h>
+#include <LoRa.h>
+#include <EEPROM.h>
+#include <Wire.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <WebServer.h>
+#include <WiFi.h>
+#include <Adafruit_ADS1X15.h>
+#include <Adafruit_BME280.h>
+
+// LoRa pins for ESP32-S3
+#define LORA_SCK    36
+#define LORA_MISO   37
+#define LORA_MOSI   35
+#define LORA_SS     17
+#define LORA_RST    16
+#define LORA_DIO0   18
+
+// Sensor pins for ESP32-S3
+#define TDS_PIN     5
+#define TURBIDITY_PIN 4
+#define TEMP_PIN    6
+
+// WiFi configuration
+#define WIFI_SSID "SIBU-AWQ2"
+#define WIFI_PASSWORD "watermonitor123"
+#define WEBSERVER_PORT 80
+
+// Device ID
+#define DEVICE_ID 2
+
+// EEPROM configuration
+#define EEPROM_SIZE 512
+
+// Custom EEPROM addresses for pH and EC calibration
+#define EEPROM_PH_CALIBRATION_ADDR 100  // 100-119 (20 bytes)
+#define EEPROM_EC_CALIBRATION_ADDR 120  // 120-139 (20 bytes)
+#define EEPROM_DO_CAL_ADDR 50           // 50-69 (20 bytes)
+#define EEPROM_TDS_CONFIG_ADDR 70       // 70-73 (4 bytes)
+#define EEPROM_TURBIDITY_CAL_ADDR 74    // 74-77 (4 bytes)
+#define EEPROM_TIDE_CONFIG_ADDR 140     // 140-151 (12 bytes)
+
+// ADS1115 configuration
+Adafruit_ADS1115 ads;
+#define ADS_GAIN GAIN_ONE  // ±4.096V
+#define ADS_MV_PER_BIT (4.096f / 32768.0f * 1000.0f)  // mV per bit
+
+// BME280 configuration
+Adafruit_BME280 bme;
+
+// ADS1115 channel definitions
+#define ADS_PH_CHANNEL     0
+#define ADS_EC_CHANNEL     1
+#define ADS_DO_CHANNEL     2
+
+// ADC and voltage reference settings
+#define VREF 3.3f
+#define ADC_RESOLUTION 4095.0f
+#define ADC_TO_MV (VREF * 1000.0f / ADC_RESOLUTION)
+
+// DO sensor configuration
+#define TWO_POINT_DO_CALIBRATION 1
+#define DO_CAL1_V 900.0f
+#define DO_CAL1_T 25.0f
+#define DO_CAL2_V 1300.0f
+#define DO_CAL2_T 18.9f
+
+// Turbidity configuration
+const int TURBIDITY_SAMPLES = 10;
+float clearWaterVoltage = 3.00f;
+
+// LoRa transmission variables
+unsigned long lastTransmission = 0;
+const unsigned long TRANSMISSION_INTERVAL = 2000;
+unsigned long packetCounter = 0;
+bool loraInitialized = false;
+
+// BME280 status
+bool bme280Ready = false;
+
+// Tide calculation configuration
+float ref_press = 1010.0000;    // hPa (x1) - 4 decimals
+float ref_tide = -20.0000;      // cm (y1) - 4 decimals
+float cv = 850.0000;            // cm/hPa -  decimals
+float tide_level = 0.0f;     // Calculated tide level
+
+// Custom pH calibration structure
+struct PHCalibration {
+  float acidVoltage;    // pH 4.0 buffer voltage
+  float acidPH;         // pH 4.0
+  float acidTemp;       // Temperature during pH 4.0 calibration
+  float neutralVoltage; // pH 7.0 buffer voltage
+  float neutralPH;      // pH 7.0
+  float neutralTemp;    // Temperature during pH 7.0 calibration
+  uint8_t points;       // Number of calibration points (0, 1, or 2)
+};
+
+// Custom EC calibration structure
+struct ECCalibration {
+  float voltage;        // Calibration voltage
+  float temperature;    // Calibration temperature
+  float ecValue;        // Calibration EC value (12.88 mS/cm)
+  bool calibrated;      // Whether EC is calibrated
+};
+
+// Initialize sensors
+OneWire oneWire(TEMP_PIN);
+DallasTemperature tempSensor(&oneWire);
+
+// Web server instance
+WebServer server(WEBSERVER_PORT);
+
+// TDS median filtering variables
+int tdsSampleCount = 30;
+int* tdsAnalogBuffer = nullptr;
+int tdsAnalogBufferIndex = 0;
+
+// Global variables for sensor readings
+float temperature = 0.0f;
+float phValue = 0.0f;
+float ecValue = 0.0f;
+float doValue = 0.0f;
+float tdsValue = 0.0f;
+float turbidityValue = 0.0f;
+bool tempSensorReady = false;
+
+// BME280 readings
+float humidity = 0.0f;
+float pressure = 0.0f;
+float airTemperature = 0.0f;  // Changed from altitude to air temperature
+
+// Voltage readings for all sensors
+float phVoltage = 0.0f;
+float ecVoltage = 0.0f;
+float doVoltage = 0.0f;
+float tdsVoltage = 0.0f;
+float turbidityVoltage = 0.0f;
+
+// Calibration variables
+bool ecCalibrationMode = false;
+bool phCalibrationMode = false;
+
+// Calibration structures
+PHCalibration phCalibration = {2032.44, 4.0, 25.0, 1500.0, 7.0, 25.0, 0};
+ECCalibration ecCalibration = {0.0, 25.0, 12.88, false};
+
+struct DOCalibration {
+  bool twoPointEnabled;
+  float cal1Voltage;
+  float cal1Temp;
+  float cal2Voltage;
+  float cal2Temp;
+};
+
+DOCalibration doCalibration = {
+  TWO_POINT_DO_CALIBRATION,
+  DO_CAL1_V,
+  DO_CAL1_T,
+  DO_CAL2_V,
+  DO_CAL2_T
+};
+
+// DO lookup table
+const uint16_t DO_Table[41] = {
+    14460, 14220, 13820, 13440, 13090, 12740, 12420, 12110, 11810, 11530,
+    11260, 11010, 10770, 10530, 10300, 10080, 9860, 9660, 9460, 9270,
+    9080, 8900, 8730, 8570, 8410, 8250, 8110, 7960, 7820, 7690,
+    7560, 7430, 7300, 7180, 7070, 6950, 6840, 6730, 6630, 6530, 6410
+};
+
+// Function declarations
+void setupWiFi();
+void handleRoot();
+void handleDOCalibration();
+void handleTDSConfiguration();
+void handleTurbidityCalibration();
+void handleResetCalibration();
+void handleSensorData();
+void saveDOCalibration();
+void saveTDSConfiguration();
+void saveTurbidityCalibration();
+void loadCalibrationData();
+void resetCalibrationToDefaults();
+void processSerialCommands();
+void printStatusSummary();
+void handleSerialCommand();
+void processWebCommand(String command);
+void handleECCalibrationAction();
+void handlePHCalibrationAction();
+void savePHCalibration();
+void saveECCalibration();
+void loadPHCalibration();
+void loadECCalibration();
+float readPH();
+float readEC();
+float readDO();
+float readTDS();
+float readTurbidity();
+float readTemperature();
+void readBME280();
+bool setupBME280();
+void saveTideConfiguration();
+void loadTideConfiguration();
+float calculateTide(float current_pressure);
+void handleTideConfiguration();
+
+// Tide calculation function
+float calculateTide(float current_pressure) {
+  float dx = ref_press - current_pressure;
+  float tide = ref_tide + (dx * cv);
+  return tide;
+}
+
+// Custom pH calculation function
+float calculatePH(float voltage, float temperature) {
+  // If not calibrated, use default values
+  if (phCalibration.points < 2) {
+    // Default calibration curve (approximate)
+    return 7.0 - (voltage - 1500.0) / 177.0;
+  }
+  
+  // Calculate slope and intercept based on two-point calibration
+  float slope = (phCalibration.neutralPH - phCalibration.acidPH) / 
+                (phCalibration.neutralVoltage - phCalibration.acidVoltage);
+  float intercept = phCalibration.neutralPH - slope * phCalibration.neutralVoltage;
+  
+  // Calculate pH value
+  float ph = slope * voltage + intercept;
+  
+  // Simple temperature compensation
+  float tempCompensation = 0.0;
+  if (temperature > 25.0) {
+    tempCompensation = (temperature - 25.0) * 0.003;
+  } else if (temperature < 25.0) {
+    tempCompensation = (25.0 - temperature) * -0.003;
+  }
+  
+  return constrain(ph + tempCompensation, 0.0, 14.0);
+}
+
+// Custom EC calculation function
+float calculateEC(float voltage, float temperature) {
+  if (!ecCalibration.calibrated) {
+    // Default calibration if not calibrated
+    return (voltage * 100.0) / 2.0; // Simple linear approximation
+  }
+  
+  // Calculate EC based on calibration
+  float kValue = (ecCalibration.ecValue * (1.0 + 0.019 * (ecCalibration.temperature - 25.0))) / 
+                 (ecCalibration.voltage / 100.0);
+  
+  // Apply temperature compensation
+  float ecValue = (voltage / 100.0) * kValue / (1.0 + 0.019 * (temperature - 25.0));
+  
+  return ecValue;
+}
+
+// ADS1115 reading function
+float readADSVoltage(uint8_t channel) {
+  int16_t adc = ads.readADC_SingleEnded(channel);
+  // Handle negative values (if any)
+  if (adc < 0) adc = 0;
+  return adc * ADS_MV_PER_BIT;
+}
+
+// BME280 reading function
+void readBME280() {
+  if (!bme280Ready) return;
+  
+  humidity = bme.readHumidity();
+  pressure = bme.readPressure() / 100.0f;  // Convert to hPa
+  airTemperature = bme.readTemperature();  // Air temperature instead of altitude
+  
+  // Validate readings
+  if (isnan(humidity) || isnan(pressure) || isnan(airTemperature)) {
+    Serial.println("BME280 reading failed!");
+    humidity = 0.0f;
+    pressure = 0.0f;
+    airTemperature = 0.0f;
+  }
+}
+
+// BME280 setup function
+bool setupBME280() {
+  Serial.print("Initializing BME280...");
+  
+  // Try primary address first (0x77)
+  if (!bme.begin(BME280_ADDRESS)) {
+    Serial.println(" FAILED ✗");
+    Serial.print("Trying alternative address 0x76...");
+    
+    // Try secondary address
+    if (!bme.begin(0x76)) {
+      Serial.println(" FAILED ✗");
+      Serial.println("BME280 not found on either address!");
+      return false;
+    } else {
+      Serial.println(" SUCCESS ✓ (0x76)");
+    }
+  } else {
+    Serial.println(" SUCCESS ✓ (0x77)");
+  }
+  
+  // Configure BME280 for environmental monitoring
+  bme.setSampling(Adafruit_BME280::MODE_NORMAL,
+                  Adafruit_BME280::SAMPLING_X1,  // temperature
+                  Adafruit_BME280::SAMPLING_X1,  // pressure
+                  Adafruit_BME280::SAMPLING_X1,  // humidity
+                  Adafruit_BME280::FILTER_OFF,
+                  Adafruit_BME280::STANDBY_MS_1000);
+  
+  bme280Ready = true;
+  return true;
+}
+
+// CRC-16 calculation function
+uint16_t calculateCRC16(uint8_t *data, size_t length) {
+  uint16_t crc = 0xFFFF;
+  for (size_t i = 0; i < length; i++) {
+    crc ^= (uint16_t)data[i];
+    for (uint8_t j = 0; j < 8; j++) {
+      if (crc & 0x0001) {
+        crc = (crc >> 1) ^ 0xA001;
+      } else {
+        crc = crc >> 1;
+      }
+    }
+  }
+  return crc;
+}
+
+// Improved temperature reading with fallback
+float readTemperature() {
+  static unsigned long lastTempRead = 0;
+  static float lastGoodTemp = 25.0f;  // Fallback temperature
+  
+  // Only read temperature every 2 seconds to avoid slowing down the main loop
+  if (millis() - lastTempRead < 2000) {
+    return lastGoodTemp;
+  }
+  
+  lastTempRead = millis();
+  
+  tempSensor.requestTemperatures();
+  float tempC = tempSensor.getTempCByIndex(0);
+  
+  // Check if temperature reading is valid
+  if (tempC == DEVICE_DISCONNECTED_C || tempC < -50.0f || tempC > 100.0f) {
+    Serial.println("Warning: Temperature sensor not connected, using fallback value (25°C)");
+    tempSensorReady = false;
+    lastGoodTemp = 25.0f;  // Use fallback value
+  } else {
+    tempSensorReady = true;
+    lastGoodTemp = tempC;  // Use actual sensor reading
+  }
+  
+  return lastGoodTemp;
+}
+
+float readEC() {
+  float voltage_mv = readADSVoltage(ADS_EC_CHANNEL);
+  ecVoltage = voltage_mv;
+  float currentTemp = readTemperature();  // Get current temperature (with fallback)
+  ecValue = calculateEC(voltage_mv, currentTemp);
+  return ecValue;
+}
+
+float readDO() {
+  float voltage_mv = readADSVoltage(ADS_DO_CHANNEL);
+  doVoltage = voltage_mv;
+  float currentTemp = readTemperature();  // Get current temperature (with fallback)
+  
+  // Ensure temperature is within valid range for DO calculation
+  uint8_t temp_int = constrain((uint8_t)currentTemp, 0, 40);
+  float do_saturation = DO_Table[temp_int] / 1000.0f;
+  
+  if (doCalibration.twoPointEnabled) {
+    // Two-point calibration calculation
+    uint16_t V_saturation = ((temp_int - doCalibration.cal2Temp) * 
+                           (doCalibration.cal1Voltage - doCalibration.cal2Voltage)) / 
+                           (doCalibration.cal1Temp - doCalibration.cal2Temp) + 
+                           doCalibration.cal2Voltage;
+    return constrain((voltage_mv * do_saturation) / V_saturation, 0.0f, 20.0f);
+  } else {
+    // One-point calibration calculation  
+    uint16_t V_saturation = doCalibration.cal1Voltage + 35 * (temp_int - doCalibration.cal1Temp);
+    return constrain((voltage_mv * do_saturation) / V_saturation, 0.0f, 20.0f);
+  }
+}
+
+float readTurbidity() {
+  long sum = 0;
+  for(int i = 0; i < TURBIDITY_SAMPLES; i++) {
+    sum += analogRead(TURBIDITY_PIN);
+    delay(10);
+  }
+  
+  int avgADC = sum / TURBIDITY_SAMPLES;
+  turbidityVoltage = (avgADC / ADC_RESOLUTION) * VREF;
+  turbidityValue = 3000 * (1 - (turbidityVoltage / clearWaterVoltage));
+  
+  if(turbidityVoltage > clearWaterVoltage) {
+    turbidityValue = 0;
+  }
+  
+  turbidityValue = constrain(turbidityValue, 0.0f, 3000.0f);
+  return turbidityValue;
+}
+
+int getMedianNum(int bArray[], int iFilterLen) {
+  int bTab[iFilterLen];
+  memcpy(bTab, bArray, iFilterLen * sizeof(int));
+  int i, j, bTemp;
+  for (j = 0; j < iFilterLen - 1; j++) {
+    for (i = 0; i < iFilterLen - j - 1; i++) {
+      if (bTab[i] > bTab[i + 1]) {
+        bTemp = bTab[i];
+        bTab[i] = bTab[i + 1];
+        bTab[i + 1] = bTemp;
+      }
+    }
+  }
+  if ((iFilterLen & 1) > 0)
+    bTemp = bTab[(iFilterLen - 1) / 2];
+  else
+    bTemp = (bTab[iFilterLen / 2] + bTab[iFilterLen / 2 - 1]) / 2;
+  return bTemp;
+}
+
+float readTDS() {
+  tdsAnalogBuffer[tdsAnalogBufferIndex] = analogRead(TDS_PIN);
+  tdsAnalogBufferIndex = (tdsAnalogBufferIndex + 1) % tdsSampleCount;
+  int medianValue = getMedianNum(tdsAnalogBuffer, tdsSampleCount);
+  float voltage = medianValue * VREF / ADC_RESOLUTION;
+  tdsVoltage = voltage;
+  float currentTemp = readTemperature();  // Get current temperature (with fallback)
+  float compensationCoefficient = 1.0f + 0.02f * (currentTemp - 25.0f);
+  float compensationVoltage = voltage / compensationCoefficient;
+  float tds = (133.42f * compensationVoltage * compensationVoltage * compensationVoltage 
+             - 255.86f * compensationVoltage * compensationVoltage 
+             + 857.39f * compensationVoltage) * 0.5f;
+  return constrain(tds, 0.0f, 1000.0f);
+}
+
+float readPH() {
+  phVoltage = readADSVoltage(ADS_PH_CHANNEL);
+  float currentTemp = readTemperature();  // Get current temperature (with fallback)
+  phValue = calculatePH(phVoltage, currentTemp);
+  return phValue;
+}
+
+void readAllSensors() {
+  temperature = readTemperature();  // Water temperature from DS18B20
+  readBME280();                    // Air conditions from BME280
+  phValue = readPH();
+  ecValue = readEC();
+  doValue = readDO();
+  tdsValue = readTDS();
+  turbidityValue = readTurbidity();
+  
+  // Calculate tide level using BME280 pressure
+  tide_level = calculateTide(pressure);
+}
+
+void sendDataPacket() {
+  // Use 39 bytes total: 37 data bytes + 2 CRC bytes
+  uint8_t packet[39];  // 39 bytes total
+  
+  packet[0] = DEVICE_ID;
+  
+  uint16_t phInt = (uint16_t)(phValue * 100.0f);
+  uint16_t ecInt = (uint16_t)(ecValue * 100.0f);
+  uint16_t doInt = (uint16_t)(doValue * 100.0f);
+  uint16_t tdsInt = (uint16_t)tdsValue;
+  uint16_t turbInt = (uint16_t)(turbidityValue * 10.0f);
+  int16_t tempInt = (int16_t)(temperature * 100.0f);
+  
+  uint16_t phVoltageInt = (uint16_t)phVoltage;
+  uint16_t ecVoltageInt = (uint16_t)ecVoltage;
+  uint16_t doVoltageInt = (uint16_t)doVoltage;
+  uint16_t tdsVoltageInt = (uint16_t)(tdsVoltage * 1000.0f);
+  uint16_t turbVoltageInt = (uint16_t)(turbidityVoltage * 1000.0f);
+  
+  // BME280 data
+  uint16_t humidityInt = (uint16_t)(humidity * 100.0f);
+  uint32_t pressureInt = (uint32_t)(pressure * 100000.0f);  // 5 decimal places
+  uint16_t airTempInt = (uint16_t)(airTemperature * 100.0f);
+  
+  // Tide data
+  int16_t tideInt = (int16_t)(tide_level * 10.0f);  // Store with 0.1 cm precision
+  
+  packet[1] = phInt >> 8;
+  packet[2] = phInt & 0xFF;
+  packet[3] = phVoltageInt >> 8;
+  packet[4] = phVoltageInt & 0xFF;
+  
+  packet[5] = ecInt >> 8;
+  packet[6] = ecInt & 0xFF;
+  packet[7] = ecVoltageInt >> 8;
+  packet[8] = ecVoltageInt & 0xFF;
+  
+  packet[9] = doInt >> 8;
+  packet[10] = doInt & 0xFF;
+  packet[11] = doVoltageInt >> 8;
+  packet[12] = doVoltageInt & 0xFF;
+  
+  packet[13] = tdsInt >> 8;
+  packet[14] = tdsInt & 0xFF;
+  packet[15] = tdsVoltageInt >> 8;
+  packet[16] = tdsVoltageInt & 0xFF;
+  
+  packet[17] = turbInt >> 8;
+  packet[18] = turbInt & 0xFF;
+  packet[19] = turbVoltageInt >> 8;
+  packet[20] = turbVoltageInt & 0xFF;
+  
+  packet[21] = tempInt >> 8;
+  packet[22] = tempInt & 0xFF;
+  
+  packet[23] = tempSensorReady ? 0x01 : 0x00;
+  
+  // BME280 data (bytes 24-32)
+  packet[24] = humidityInt >> 8;
+  packet[25] = humidityInt & 0xFF;
+  packet[26] = (pressureInt >> 24) & 0xFF;
+  packet[27] = (pressureInt >> 16) & 0xFF;
+  packet[28] = (pressureInt >> 8) & 0xFF;
+  packet[29] = pressureInt & 0xFF;
+  packet[30] = airTempInt >> 8;
+  packet[31] = airTempInt & 0xFF;
+  
+  // Tide data (bytes 32-33)
+  packet[32] = tideInt >> 8;
+  packet[33] = tideInt & 0xFF;
+  
+  // Status bytes (bytes 34-35)
+  packet[34] = bme280Ready ? 0x01 : 0x00;
+  packet[35] = tempSensorReady ? 0x01 : 0x00;
+  
+  // Calculate CRC for data bytes 0-35 (36 bytes)
+  uint16_t crc = calculateCRC16(packet, 36);
+  
+  // Add CRC bytes at positions 36-37
+  packet[36] = crc >> 8;
+  packet[37] = crc & 0xFF;
+  
+  if (loraInitialized) {
+    Serial.print("Transmitting 38-byte packet...");
+    LoRa.beginPacket();
+    LoRa.write(packet, 38);  // Send exactly 38 bytes
+    bool success = LoRa.endPacket();
+    if (success) {
+      Serial.println(" SUCCESS ✓");
+      packetCounter++;
+    } else {
+      Serial.println(" FAILED ✗");
+    }
+    LoRa.idle();
+  } else {
+    Serial.println("LoRa not initialized - skipping transmission");
+  }
+}
+
+void printStatusSummary() {
+  static unsigned long lastSummary = 0;
+  if (millis() - lastSummary >= 10000) {
+    Serial.printf("[STATUS] T:%.1fC pH:%.1f EC:%.1f DO:%.1f TDS:%.0f Turb:%.1f Tide:%.1fcm ", 
+                 temperature, phValue, ecValue, doValue, tdsValue, turbidityValue, tide_level);
+    Serial.printf("BME[Air:%.1f°C H:%.1f%% P:%.5fhPa] TX:%d\n", 
+                 airTemperature, humidity, pressure, packetCounter);
+    lastSummary = millis();
+  }
+}
+
+void processSerialCommands() {
+  if (Serial.available()) {
+    String command = Serial.readStringUntil('\n');
+    command.trim();
+    processWebCommand(command);
+  }
+}
+
+void processWebCommand(String command) {
+  command.toLowerCase();
+  
+  if (command == "status") {
+    Serial.printf("\nSensor Status:\n");
+    Serial.printf("Water Temp: %.1fC (%s)\n", temperature, tempSensorReady ? "OK" : "NOT CONNECTED");
+    Serial.printf("pH: %.2f (%dmV)\n", phValue, (int)phVoltage);
+    Serial.printf("EC: %.2f mS/cm (%dmV)\n", ecValue, (int)ecVoltage);
+    Serial.printf("DO: %.2f mg/L (%dmV)\n", doValue, (int)doVoltage);
+    Serial.printf("TDS: %.0f ppm (%dmV)\n", tdsValue, (int)(tdsVoltage * 1000));
+    Serial.printf("Turb: %.1f NTU (%dmV)\n", turbidityValue, (int)(turbidityVoltage * 1000));
+    Serial.printf("Tide Level: %.1f cm\n", tide_level);
+    Serial.printf("BME280 - Air Temp: %.1f°C, Hum: %.1f%%, Press: %.5f hPa (%s)\n", 
+                 airTemperature, humidity, pressure, bme280Ready ? "OK" : "NOT CONNECTED");
+    Serial.printf("pH Calibration Points: %d/2\n", phCalibration.points);
+  }
+  else if (command == "reset_calibration") {
+    Serial.println("Resetting calibration to defaults");
+    resetCalibrationToDefaults();
+  }
+  else if (command == "calibration_status") {
+    Serial.printf("pH Calibration Points: %d/2\n", phCalibration.points);
+    if (phCalibration.points >= 1) {
+      Serial.printf("  pH 7.0: %.1fmV at %.1f°C\n", phCalibration.neutralVoltage, phCalibration.neutralTemp);
+    }
+    if (phCalibration.points >= 2) {
+      Serial.printf("  pH 4.0: %.1fmV at %.1f°C\n", phCalibration.acidVoltage, phCalibration.acidTemp);
+    }
+    Serial.printf("EC Calibration: %s\n", ecCalibration.calibrated ? "CALIBRATED" : "NOT CALIBRATED");
+    if (ecCalibration.calibrated) {
+      Serial.printf("  EC: %.1fmV at %.1f°C for %.2f mS/cm\n", 
+                   ecCalibration.voltage, ecCalibration.temperature, ecCalibration.ecValue);
+    }
+    Serial.printf("Tide Configuration:\n");
+    Serial.printf("  Ref Pressure: %.1f hPa\n", ref_press);
+    Serial.printf("  Ref Tide: %.1f cm\n", ref_tide);
+    Serial.printf("  Coefficient: %.1f cm/hPa\n", cv);
+    Serial.printf("BME280: %s\n", bme280Ready ? "CONNECTED" : "NOT CONNECTED");
+  }
+  else if (command.startsWith("calph_acid ")) {
+    // Format: calph_acid <voltage> <temperature>
+    int spaceIndex1 = command.indexOf(' ', 11);
+    if (spaceIndex1 != -1) {
+      String voltageStr = command.substring(11, spaceIndex1);
+      String tempStr = command.substring(spaceIndex1 + 1);
+      
+      phCalibration.acidVoltage = voltageStr.toFloat();
+      phCalibration.acidTemp = tempStr.toFloat();
+      phCalibration.acidPH = 4.0;
+      if (phCalibration.points < 2) phCalibration.points = 2;
+      savePHCalibration();
+      
+      Serial.printf("pH 4.0 calibration set: %.1fmV at %.1f°C\n", 
+                   phCalibration.acidVoltage, phCalibration.acidTemp);
+    } else {
+      Serial.println("Invalid format. Use: calph_acid <voltage> <temperature>");
+    }
+  }
+  else if (command.startsWith("calph_neutral ")) {
+    // Format: calph_neutral <voltage> <temperature>
+    int spaceIndex1 = command.indexOf(' ', 14);
+    if (spaceIndex1 != -1) {
+      String voltageStr = command.substring(14, spaceIndex1);
+      String tempStr = command.substring(spaceIndex1 + 1);
+      
+      phCalibration.neutralVoltage = voltageStr.toFloat();
+      phCalibration.neutralTemp = tempStr.toFloat();
+      phCalibration.neutralPH = 7.0;
+      if (phCalibration.points < 1) phCalibration.points = 1;
+      savePHCalibration();
+      
+      Serial.printf("pH 7.0 calibration set: %.1fmV at %.1f°C\n", 
+                   phCalibration.neutralVoltage, phCalibration.neutralTemp);
+    } else {
+      Serial.println("Invalid format. Use: calph_neutral <voltage> <temperature>");
+    }
+  }
+  else if (command.startsWith("calec ")) {
+    // Format: calec <voltage> <temperature>
+    int spaceIndex1 = command.indexOf(' ', 6);
+    if (spaceIndex1 != -1) {
+      String voltageStr = command.substring(6, spaceIndex1);
+      String tempStr = command.substring(spaceIndex1 + 1);
+      
+      ecCalibration.voltage = voltageStr.toFloat();
+      ecCalibration.temperature = tempStr.toFloat();
+      ecCalibration.ecValue = 12.88;
+      ecCalibration.calibrated = true;
+      saveECCalibration();
+      
+      Serial.printf("EC calibration set: %.1fmV at %.1f°C for 12.88 mS/cm\n", 
+                   ecCalibration.voltage, ecCalibration.temperature);
+    } else {
+      Serial.println("Invalid format. Use: calec <voltage> <temperature>");
+    }
+  }
+  else if (command.startsWith("caltide ")) {
+    // Format: caltide <ref_press> <ref_tide> <cv>
+    int spaceIndex1 = command.indexOf(' ', 8);
+    int spaceIndex2 = command.indexOf(' ', spaceIndex1 + 1);
+    if (spaceIndex1 != -1 && spaceIndex2 != -1) {
+      String refPressStr = command.substring(8, spaceIndex1);
+      String refTideStr = command.substring(spaceIndex1 + 1, spaceIndex2);
+      String cvStr = command.substring(spaceIndex2 + 1);
+      
+      ref_press = refPressStr.toFloat();
+      ref_tide = refTideStr.toFloat();
+      cv = cvStr.toFloat();
+      saveTideConfiguration();
+      
+      Serial.printf("Tide calibration set: Ref Pressure: %.1f hPa, Ref Tide: %.1f cm, CV: %.1f cm/hPa\n", 
+                   ref_press, ref_tide, cv);
+    } else {
+      Serial.println("Invalid format. Use: caltide <ref_press> <ref_tide> <cv>");
+    }
+  }
+  else if (command == "eeprom_dump") {
+    Serial.println("First 32 bytes of EEPROM:");
+    for (int i = 0; i < 32; i++) {
+      Serial.printf("EEPROM[%d]: %d\n", i, EEPROM.read(i));
+    }
+  }
+  else if (command == "bme_status") {
+    Serial.printf("BME280 Status: %s\n", bme280Ready ? "CONNECTED" : "NOT CONNECTED");
+    if (bme280Ready) {
+      Serial.printf("  Air Temperature: %.1f°C\n", airTemperature);
+      Serial.printf("  Humidity: %.1f%%\n", humidity);
+      Serial.printf("  Pressure: %.5f hPa\n", pressure);
+    }
+  }
+  else if (command == "tide_status") {
+    Serial.printf("Tide Level: %.1f cm\n", tide_level);
+    Serial.printf("Tide Configuration:\n");
+    Serial.printf("  Ref Pressure: %.1f hPa\n", ref_press);
+    Serial.printf("  Ref Tide: %.1f cm\n", ref_tide);
+    Serial.printf("  Coefficient: %.1f cm/hPa\n", cv);
+    Serial.printf("  Current Pressure: %.5f hPa\n", pressure);
+  }
+  else {
+    Serial.printf("Unknown command: %s\n", command.c_str());
+    Serial.println("Available commands:");
+    Serial.println("  status - Show current sensor readings");
+    Serial.println("  calibration_status - Show calibration details");
+    Serial.println("  bme_status - Show BME280 status and readings");
+    Serial.println("  tide_status - Show tide level and configuration");
+    Serial.println("  reset_calibration - Reset all calibration to defaults");
+    Serial.println("  calph_acid <voltage> <temp> - Set pH 4.0 calibration");
+    Serial.println("  calph_neutral <voltage> <temp> - Set pH 7.0 calibration");
+    Serial.println("  calec <voltage> <temp> - Set EC calibration (12.88 mS/cm)");
+    Serial.println("  caltide <ref_press> <ref_tide> <cv> - Set tide calibration");
+    Serial.println("  eeprom_dump - Show EEPROM contents");
+  }
+}
+
+void savePHCalibration() {
+  EEPROM.writeFloat(EEPROM_PH_CALIBRATION_ADDR, phCalibration.acidVoltage);
+  EEPROM.writeFloat(EEPROM_PH_CALIBRATION_ADDR + 4, phCalibration.acidPH);
+  EEPROM.writeFloat(EEPROM_PH_CALIBRATION_ADDR + 8, phCalibration.acidTemp);
+  EEPROM.writeFloat(EEPROM_PH_CALIBRATION_ADDR + 12, phCalibration.neutralVoltage);
+  EEPROM.writeFloat(EEPROM_PH_CALIBRATION_ADDR + 16, phCalibration.neutralPH);
+  EEPROM.writeFloat(EEPROM_PH_CALIBRATION_ADDR + 20, phCalibration.neutralTemp);
+  EEPROM.write(EEPROM_PH_CALIBRATION_ADDR + 24, phCalibration.points);
+  EEPROM.commit();
+}
+
+void saveECCalibration() {
+  EEPROM.writeFloat(EEPROM_EC_CALIBRATION_ADDR, ecCalibration.voltage);
+  EEPROM.writeFloat(EEPROM_EC_CALIBRATION_ADDR + 4, ecCalibration.temperature);
+  EEPROM.writeFloat(EEPROM_EC_CALIBRATION_ADDR + 8, ecCalibration.ecValue);
+  EEPROM.write(EEPROM_EC_CALIBRATION_ADDR + 12, ecCalibration.calibrated ? 1 : 0);
+  EEPROM.commit();
+}
+
+void saveDOCalibration() {
+  EEPROM.write(EEPROM_DO_CAL_ADDR, doCalibration.twoPointEnabled ? 1 : 0);
+  EEPROM.writeFloat(EEPROM_DO_CAL_ADDR + 1, doCalibration.cal1Voltage);
+  EEPROM.writeFloat(EEPROM_DO_CAL_ADDR + 5, doCalibration.cal1Temp);
+  EEPROM.writeFloat(EEPROM_DO_CAL_ADDR + 9, doCalibration.cal2Voltage);
+  EEPROM.writeFloat(EEPROM_DO_CAL_ADDR + 13, doCalibration.cal2Temp);
+  EEPROM.commit();
+}
+
+void saveTDSConfiguration() {
+  EEPROM.write(EEPROM_TDS_CONFIG_ADDR, tdsSampleCount);
+  EEPROM.commit();
+}
+
+void saveTurbidityCalibration() {
+  EEPROM.writeFloat(EEPROM_TURBIDITY_CAL_ADDR, clearWaterVoltage);
+  EEPROM.commit();
+}
+
+void saveTideConfiguration() {
+  EEPROM.writeFloat(EEPROM_TIDE_CONFIG_ADDR, ref_press);
+  EEPROM.writeFloat(EEPROM_TIDE_CONFIG_ADDR + 4, ref_tide);
+  EEPROM.writeFloat(EEPROM_TIDE_CONFIG_ADDR + 8, cv);
+  EEPROM.commit();
+}
+
+void loadPHCalibration() {
+  phCalibration.acidVoltage = EEPROM.readFloat(EEPROM_PH_CALIBRATION_ADDR);
+  phCalibration.acidPH = EEPROM.readFloat(EEPROM_PH_CALIBRATION_ADDR + 4);
+  phCalibration.acidTemp = EEPROM.readFloat(EEPROM_PH_CALIBRATION_ADDR + 8);
+  phCalibration.neutralVoltage = EEPROM.readFloat(EEPROM_PH_CALIBRATION_ADDR + 12);
+  phCalibration.neutralPH = EEPROM.readFloat(EEPROM_PH_CALIBRATION_ADDR + 16);
+  phCalibration.neutralTemp = EEPROM.readFloat(EEPROM_PH_CALIBRATION_ADDR + 20);
+  phCalibration.points = EEPROM.read(EEPROM_PH_CALIBRATION_ADDR + 24);
+  
+  // Check if values are valid (not NaN)
+  if (isnan(phCalibration.acidVoltage) || isnan(phCalibration.neutralVoltage)) {
+    phCalibration.acidVoltage = 2032.44;
+    phCalibration.acidPH = 4.0;
+    phCalibration.acidTemp = 25.0;
+    phCalibration.neutralVoltage = 1500.0;
+    phCalibration.neutralPH = 7.0;
+    phCalibration.neutralTemp = 25.0;
+    phCalibration.points = 0;
+  }
+}
+
+void loadECCalibration() {
+  ecCalibration.voltage = EEPROM.readFloat(EEPROM_EC_CALIBRATION_ADDR);
+  ecCalibration.temperature = EEPROM.readFloat(EEPROM_EC_CALIBRATION_ADDR + 4);
+  ecCalibration.ecValue = EEPROM.readFloat(EEPROM_EC_CALIBRATION_ADDR + 8);
+  ecCalibration.calibrated = EEPROM.read(EEPROM_EC_CALIBRATION_ADDR + 12) == 1;
+  
+  // Check if values are valid (not NaN)
+  if (isnan(ecCalibration.voltage) || isnan(ecCalibration.temperature) || isnan(ecCalibration.ecValue)) {
+    ecCalibration.voltage = 0.0;
+    ecCalibration.temperature = 25.0;
+    ecCalibration.ecValue = 12.88;
+    ecCalibration.calibrated = false;
+  }
+}
+
+void loadTideConfiguration() {
+  ref_press = EEPROM.readFloat(EEPROM_TIDE_CONFIG_ADDR);
+  ref_tide = EEPROM.readFloat(EEPROM_TIDE_CONFIG_ADDR + 4);
+  cv = EEPROM.readFloat(EEPROM_TIDE_CONFIG_ADDR + 8);
+  
+  // Check if values are valid
+  if (isnan(ref_press) || isnan(ref_tide) || isnan(cv)) {
+    ref_press = 1010.0;
+    ref_tide = -20.0;
+    cv = 850.0;
+    saveTideConfiguration();
+  }
+}
+
+void loadCalibrationData() {
+  doCalibration.twoPointEnabled = EEPROM.read(EEPROM_DO_CAL_ADDR) == 1;
+  doCalibration.cal1Voltage = EEPROM.readFloat(EEPROM_DO_CAL_ADDR + 1);
+  doCalibration.cal1Temp = EEPROM.readFloat(EEPROM_DO_CAL_ADDR + 5);
+  doCalibration.cal2Voltage = EEPROM.readFloat(EEPROM_DO_CAL_ADDR + 9);
+  doCalibration.cal2Temp = EEPROM.readFloat(EEPROM_DO_CAL_ADDR + 13);
+  
+  tdsSampleCount = EEPROM.read(EEPROM_TDS_CONFIG_ADDR);
+  if (tdsSampleCount < 1 || tdsSampleCount > 100) {
+    tdsSampleCount = 30;
+    saveTDSConfiguration();
+  }
+  
+  float savedClearWaterVoltage = EEPROM.readFloat(EEPROM_TURBIDITY_CAL_ADDR);
+  if (!isnan(savedClearWaterVoltage) && savedClearWaterVoltage > 0) {
+    clearWaterVoltage = savedClearWaterVoltage;
+  }
+  
+  loadPHCalibration();
+  loadECCalibration();
+  loadTideConfiguration();
+}
+
+void resetCalibrationToDefaults() {
+  doCalibration.twoPointEnabled = TWO_POINT_DO_CALIBRATION;
+  doCalibration.cal1Voltage = DO_CAL1_V;
+  doCalibration.cal1Temp = DO_CAL1_T;
+  doCalibration.cal2Voltage = DO_CAL2_V;
+  doCalibration.cal2Temp = DO_CAL2_T;
+  saveDOCalibration();
+  
+  tdsSampleCount = 30;
+  if (tdsAnalogBuffer != nullptr) {
+    delete[] tdsAnalogBuffer;
+  }
+  tdsAnalogBuffer = new int[tdsSampleCount];
+  for (int i = 0; i < tdsSampleCount; i++) {
+    tdsAnalogBuffer[i] = 0;
+  }
+  saveTDSConfiguration();
+  
+  clearWaterVoltage = 1.45f;
+  saveTurbidityCalibration();
+  
+  // Reset pH calibration
+  phCalibration.acidVoltage = 2032.44;
+  phCalibration.acidPH = 4.0;
+  phCalibration.acidTemp = 25.0;
+  phCalibration.neutralVoltage = 1500.0;
+  phCalibration.neutralPH = 7.0;
+  phCalibration.neutralTemp = 25.0;
+  phCalibration.points = 0;
+  savePHCalibration();
+  
+  // Reset EC calibration
+  ecCalibration.voltage = 0.0;
+  ecCalibration.temperature = 25.0;
+  ecCalibration.ecValue = 12.88;
+  ecCalibration.calibrated = false;
+  saveECCalibration();
+  
+  // Reset tide configuration
+  ref_press = 1010.0;
+  ref_tide = -20.0;
+  cv = 850.0;
+  saveTideConfiguration();
+  
+  Serial.println("All calibration values reset to defaults");
+}
+
+void setupWiFi() {
+  WiFi.softAP(WIFI_SSID, WIFI_PASSWORD);
+  WiFi.setTxPower(WIFI_POWER_8_5dBm);
+  Serial.println("Access Point Started");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.softAPIP());
+}
+
+void handleSerialCommand() {
+  if (server.method() == HTTP_POST) {
+    if (server.hasArg("command")) {
+      String command = server.arg("command");
+      command.trim();
+      Serial.printf("Web command received: %s\n", command.c_str());
+      processWebCommand(command);
+      server.send(200, "text/plain", "Command executed: " + command);
+    } else {
+      server.send(400, "text/plain", "Missing command parameter");
+    }
+  } else {
+    server.send(405, "text/plain", "Method Not Allowed");
+  }
+}
+
+void handleTideConfiguration() {
+  if (server.method() == HTTP_POST) {
+    if (server.hasArg("ref_press") && server.hasArg("ref_tide") && server.hasArg("cv")) {
+      ref_press = server.arg("ref_press").toFloat();
+      ref_tide = server.arg("ref_tide").toFloat();
+      cv = server.arg("cv").toFloat();
+      saveTideConfiguration();
+      server.sendHeader("Location", "/");
+      server.send(303);
+    } else {
+      server.send(400, "text/plain", "Missing parameters");
+    }
+  }
+}
+
+void handleRoot() {
+  String html = "<!DOCTYPE html><html><head>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<meta http-equiv='refresh' content='30'>"; 
+  html += "<title>Water Quality Monitoring</title>";
+  html += "<style>";
+  html += "body { font-family: Arial, sans-serif; margin: 20px; max-width: 800px; margin: auto; }";
+  html += ".section { background: #f8f9fa; padding: 20px; margin-bottom: 20px; border-radius: 8px; }";
+  html += "table { width: 100%; border-collapse: collapse; margin: 10px 0; }";
+  html += "td, th { padding: 8px; text-align: left; border-bottom: 1px solid #ddd; }";
+  html += ".button { background-color: #4CAF50; color: white; padding: 10px 15px; border: none; border-radius: 4px; cursor: pointer; margin: 5px; }";
+  html += ".button.blue { background-color: #337ab7; }";
+  html += ".button.red { background-color: #f44336; }";
+  html += ".button.orange { background-color: #ff9800; }";
+  html += ".button.purple { background-color: #9c27b0; }";
+  html += ".value { font-weight: bold; }";
+  html += ".default-value { color: #666; font-style: italic; }";
+  html += ".calibration-status { padding: 10px; margin: 10px 0; border-radius: 4px; }";
+  html += ".calibration-active { background-color: #dff0d8; color: #3c763d; border: 1px solid #d6e9c6; }";
+  html += ".calibration-inactive { background-color: #f2dede; color: #a94442; border: 1px solid #ebccd1; }";
+  html += "#last-update { font-size: 0.8em; color: #666; }";
+  html += ".calibration-info { background-color: #e7f3fe; padding: 10px; border-left: 4px solid #2196F3; margin: 10px 0; }";
+  html += ".bme-section { background-color: #e8f5e8; border-left: 4px solid #4CAF50; }";
+  html += ".tide-section { background-color: #e3f2fd; border-left: 4px solid #2196F3; }";
+  html += "</style>";
+  
+  html += "<script>";
+  html += "function updateSensorData() {";
+  html += "  fetch('/sensor_data')";
+  html += "    .then(response => response.json())";
+  html += "    .then(data => {";
+  html += "      document.getElementById('ph-value').innerText = data.ph.toFixed(2);";
+  html += "      document.getElementById('ph-voltage').innerText = data.ph_voltage.toFixed(1);";
+  html += "      document.getElementById('ec-value').innerText = data.ec.toFixed(2);";
+  html += "      document.getElementById('ec-voltage').innerText = data.ec_voltage.toFixed(1);";
+  html += "      document.getElementById('do-value').innerText = data.do.toFixed(2);";
+  html += "      document.getElementById('do-voltage').innerText = data.do_voltage.toFixed(1);";
+  html += "      document.getElementById('tds-value').innerText = data.tds.toFixed(0);";
+  html += "      document.getElementById('tds-voltage').innerText = (data.tds_voltage * 1000).toFixed(1);";
+  html += "      document.getElementById('turb-value').innerText = data.turbidity.toFixed(1);";
+  html += "      document.getElementById('turb-voltage').innerText = (data.turbidity_voltage * 1000).toFixed(1);";
+  html += "      document.getElementById('temp-value').innerText = data.temp.toFixed(1);";
+  html += "      document.getElementById('temp-status').innerText = data.temp_ready ? 'OK' : 'NOT CONNECTED';";
+  html += "      document.getElementById('humidity-value').innerText = data.humidity.toFixed(1);";
+  html += "      document.getElementById('pressure-value').innerText = data.pressure.toFixed(5);";
+  html += "      document.getElementById('air-temp-value').innerText = data.air_temp.toFixed(1);";
+  html += "      document.getElementById('bme-status').innerText = data.bme_ready ? 'OK' : 'NOT CONNECTED';";
+  html += "      document.getElementById('tide-value').innerText = data.tide_level.toFixed(1);";
+  html += "      document.getElementById('last-update').innerText = 'Last updated: ' + new Date().toLocaleTimeString();";
+  html += "    });";
+  html += "}";
+  html += "setInterval(updateSensorData, 2000);";
+  html += "window.onload = updateSensorData;";
+  
+  html += "function sendCommand() {";
+  html += "  var command = document.getElementById('commandInput').value;";
+  html += "  if (command.trim() === '') return;";
+  html += "  var formData = new FormData();";
+  html += "  formData.append('command', command);";
+  html += "  fetch('/serial_command', {";
+  html += "    method: 'POST',";
+  html += "    body: formData";
+  html += "  })";
+  html += "  .then(response => response.text())";
+  html += "  .then(data => {";
+  html += "    document.getElementById('commandResult').innerText = data;";
+  html += "    document.getElementById('commandResult').style.display = 'block';";
+  html += "    document.getElementById('commandInput').value = '';";
+  html += "  })";
+  html += "  .catch(error => {";
+  html += "    document.getElementById('commandResult').innerText = 'Error: ' + error;";
+  html += "    document.getElementById('commandResult').style.display = 'block';";
+  html += "  });";
+  html += "}";
+  
+  html += "function sendQuickCommand(cmd) {";
+  html += "  document.getElementById('commandInput').value = cmd;";
+  html += "  sendCommand();";
+  html += "}";
+  
+  html += "document.getElementById('commandInput').addEventListener('keypress', function(e) {";
+  html += "  if (e.key === 'Enter') {";
+  html += "    e.preventDefault();";
+  html += "    sendCommand();";
+  html += "  }";
+  html += "});";
+  html += "</script>";
+  html += "</head><body>";
+
+  html += "<h1>Water Quality Monitoring <span id='last-update'></span></h1>";
+  
+  // Current Readings Section - Updated with BME280 and Tide
+  html += "<div class='section'>";
+  html += "<h2>Current Sensor Readings</h2>";
+  html += "<table>";
+  html += "<tr><td>pH:</td><td><span id='ph-value' class='value'>" + String(phValue, 2) + "</span> (Voltage: <span id='ph-voltage'>" + String(phVoltage, 1) + "</span> mV)</td></tr>";
+  html += "<tr><td>EC:</td><td><span id='ec-value' class='value'>" + String(ecValue, 2) + "</span> mS/cm (Voltage: <span id='ec-voltage'>" + String(ecVoltage, 1) + "</span> mV)</td></tr>";
+  html += "<tr><td>DO:</td><td><span id='do-value' class='value'>" + String(doValue, 2) + "</span> mg/L (Voltage: <span id='do-voltage'>" + String(doVoltage, 1) + "</span> mV)</td></tr>";
+  html += "<tr><td>TDS:</td><td><span id='tds-value' class='value'>" + String(tdsValue, 0) + "</span> ppm (Voltage: <span id='tds-voltage'>" + String(tdsVoltage * 1000.0f, 1) + "</span> mV)</td></tr>";
+  html += "<tr><td>Turbidity:</td><td><span id='turb-value' class='value'>" + String(turbidityValue, 1) + "</span> NTU (Voltage: <span id='turb-voltage'>" + String(turbidityVoltage * 1000.0f, 1) + "</span> mV)</td></tr>";
+  html += "<tr><td>Water Temperature:</td><td><span id='temp-value' class='value'>" + String(temperature, 1) + "</span> °C (Status: <span id='temp-status'>" + (tempSensorReady ? "OK" : "NOT CONNECTED") + "</span>)</td></tr>";
+  html += "<tr><td>Tide Level:</td><td><span id='tide-value' class='value'>" + String(tide_level, 1) + "</span> cm</td></tr>";
+  html += "</table>";
+  html += "</div>";
+
+  // BME280 Environmental Data Section
+  html += "<div class='section bme-section'>";
+  html += "<h2>Environmental Conditions (BME280)</h2>";
+  html += "<table>";
+  html += "<tr><td>Air Temperature:</td><td><span id='air-temp-value' class='value'>" + String(airTemperature, 1) + "</span> °C</td></tr>";
+  html += "<tr><td>Humidity:</td><td><span id='humidity-value' class='value'>" + String(humidity, 1) + "</span> %</td></tr>";
+  html += "<tr><td>Pressure:</td><td><span id='pressure-value' class='value'>" + String(pressure, 5) + "</span> hPa</td></tr>";
+  html += "<tr><td>Status:</td><td><span id='bme-status' class='value'>" + String(bme280Ready ? "OK" : "NOT CONNECTED") + "</span></td></tr>";
+  html += "</table>";
+  html += "</div>";
+
+  // Tide Level Section
+  html += "<div class='section tide-section'>";
+  html += "<h2>Tide Level Calculation</h2>";
+  html += "<p><strong>Current Tide Level: <span id='tide-value' class='value'>" + String(tide_level, 1) + "</span> cm</strong></p>";
+  html += "<p>Formula: Tide = " + String(ref_tide, 1) + " + (" + String(ref_press, 1) + " - Pressure) × " + String(cv, 1) + "</p>";
+  html += "</div>";
+
+  // Calibration Status Section
+  html += "<div class='section'>";
+  html += "<h2>Calibration Status</h2>";
+  html += "<div class='calibration-info'>";
+  html += "<p><strong>pH Calibration Points:</strong> " + String(phCalibration.points) + "/2</p>";
+  if (phCalibration.points >= 1) {
+    html += "<p><strong>pH 7.0:</strong> " + String(phCalibration.neutralVoltage, 1) + " mV at " + String(phCalibration.neutralTemp, 1) + "°C</p>";
+  }
+  if (phCalibration.points >= 2) {
+    html += "<p><strong>pH 4.0:</strong> " + String(phCalibration.acidVoltage, 1) + " mV at " + String(phCalibration.acidTemp, 1) + "°C</p>";
+  }
+  html += "<p><strong>EC Calibration:</strong> " + String(ecCalibration.calibrated ? "CALIBRATED" : "NOT CALIBRATED") + "</p>";
+  if (ecCalibration.calibrated) {
+    html += "<p><strong>EC:</strong> " + String(ecCalibration.voltage, 1) + " mV at " + String(ecCalibration.temperature, 1) + "°C for 12.88 mS/cm</p>";
+  }
+  html += "<p><strong>Tide Configuration:</strong></p>";
+  html += "<p><strong>Ref Pressure:</strong> " + String(ref_press, 1) + " hPa</p>";
+  html += "<p><strong>Ref Tide:</strong> " + String(ref_tide, 1) + " cm</p>";
+  html += "<p><strong>Coefficient:</strong> " + String(cv, 1) + " cm/hPa</p>";
+  html += "<p><strong>BME280:</strong> " + String(bme280Ready ? "CONNECTED" : "NOT CONNECTED") + "</p>";
+  html += "</div>";
+  html += "</div>";
+
+  // Tide Configuration Section
+  html += "<div class='section'>";
+  html += "<h2>Tide Level Configuration</h2>";
+  html += "<form action='/configure_tide' method='post'>";
+  html += "<table>";
+  html += "<tr><td>Reference Pressure (hPa):</td><td><input type='number' step='0.0001' name='ref_press' value='" + String(ref_press, 4) + "'></td>";
+  html += "<td class='default-value'>(x1)</td></tr>";
+  html += "<tr><td>Reference Tide Level (cm):</td><td><input type='number' step='0.0001' name='ref_tide' value='" + String(ref_tide, 4) + "'></td>";
+  html += "<td class='default-value'>(y1)</td></tr>";
+  html += "<tr><td>Coefficient (cm/hPa):</td><td><input type='number' step='0.0001' name='cv' value='" + String(cv, 4) + "'></td>";
+  html += "<td class='default-value'>(cv)</td></tr>";
+  html += "</table>";
+  html += "<input type='submit' value='Save Tide Configuration' class='button purple'>";
+  html += "</form>";
+  html += "</div>";
+
+  // pH Calibration Section
+  html += "<div class='section'>";
+  html += "<h2>pH Sensor Calibration</h2>";
+  html += "<form action='/serial_command' method='post'>";
+  html += "<table>";
+  html += "<tr><td>pH 7.0 Voltage (mV):</td><td><input type='number' step='0.1' name='ph7_voltage' value='" + String(phCalibration.neutralVoltage, 1) + "'></td></tr>";
+  html += "<tr><td>pH 7.0 Temperature (°C):</td><td><input type='number' step='0.1' name='ph7_temp' value='" + String(phCalibration.neutralTemp, 1) + "'></td></tr>";
+  html += "<tr><td>pH 4.0 Voltage (mV):</td><td><input type='number' step='0.1' name='ph4_voltage' value='" + String(phCalibration.acidVoltage, 1) + "'></td></tr>";
+  html += "<tr><td>pH 4.0 Temperature (°C):</td><td><input type='number' step='0.1' name='ph4_temp' value='" + String(phCalibration.acidTemp, 1) + "'></td></tr>";
+  html += "</table>";
+  html += "<input type='hidden' name='command' id='phCalCommand' value=''>";
+  html += "<input type='button' value='Set pH 7.0 Calibration' class='button blue' onclick=\"document.getElementById('phCalCommand').value='calph_neutral ' + document.getElementsByName('ph7_voltage')[0].value + ' ' + document.getElementsByName('ph7_temp')[0].value; this.form.submit();\">";
+  html += "<input type='button' value='Set pH 4.0 Calibration' class='button blue' onclick=\"document.getElementById('phCalCommand').value='calph_acid ' + document.getElementsByName('ph4_voltage')[0].value + ' ' + document.getElementsByName('ph4_temp')[0].value; this.form.submit();\">";
+  html += "</form>";
+  html += "</div>";
+
+  // EC Calibration Section
+  html += "<div class='section'>";
+  html += "<h2>EC Sensor Calibration (12.88 mS/cm)</h2>";
+  html += "<form action='/serial_command' method='post'>";
+  html += "<table>";
+  html += "<tr><td>EC Voltage (mV):</td><td><input type='number' step='0.1' name='ec_voltage' value='" + String(ecCalibration.voltage, 1) + "'></td></tr>";
+  html += "<tr><td>EC Temperature (°C):</td><td><input type='number' step='0.1' name='ec_temp' value='" + String(ecCalibration.temperature, 1) + "'></td></tr>";
+  html += "</table>";
+  html += "<input type='hidden' name='command' id='ecCalCommand' value=''>";
+  html += "<input type='button' value='Set EC Calibration' class='button orange' onclick=\"document.getElementById('ecCalCommand').value='calec ' + document.getElementsByName('ec_voltage')[0].value + ' ' + document.getElementsByName('ec_temp')[0].value; this.form.submit();\">";
+  html += "</form>";
+  html += "</div>";
+
+  // DO Calibration Section
+  html += "<div class='section'>";
+  html += "<h2>Dissolved Oxygen (DO) Calibration</h2>";
+  html += "<form action='/calibrate_do' method='post'>";
+  html += "<table>";
+  html += "<tr><td>Calibration Type:</td><td>";
+  html += "<select name='do_cal_type'>";
+  html += "<option value='1'" + String(doCalibration.twoPointEnabled ? " selected" : "") + ">2-Point Calibration</option>";
+  html += "<option value='0'" + String(!doCalibration.twoPointEnabled ? " selected" : "") + ">1-Point Calibration</option>";
+  html += "</select></td><td class='default-value'>(Default: 2-Point)</td></tr>";
+  html += "<tr><td>Point 1 Voltage (Zero O₂):</td><td><input type='number' step='0.1' name='do_cal1_v' value='" + String(doCalibration.cal1Voltage, 1) + "'></td>";
+  html += "<td class='default-value'>(Default: " + String(DO_CAL1_V, 1) + " mV)</td></tr>";
+  html += "<tr><td>Point 1 Temperature:</td><td><input type='number' step='0.1' name='do_cal1_t' value='" + String(doCalibration.cal1Temp, 1) + "'></td>";
+  html += "<td class='default-value'>(Default: " + String(DO_CAL1_T, 1) + " °C)</td></tr>";
+  if (doCalibration.twoPointEnabled) {
+  html += "<tr><td>Point 2 Voltage (Saturated O₂):</td><td><input type='number' step='0.1' name='do_cal2_v' value='" + String(doCalibration.cal2Voltage, 1) + "'></td>";
+  html += "<td class='default-value'>(Default: " + String(DO_CAL2_V, 1) + " mV)</td></tr>";
+  html += "<tr><td>Point 2 Temperature:</td><td><input type='number' step='0.1' name='do_cal2_t' value='" + String(doCalibration.cal2Temp, 1) + "'></td>";
+  html += "<td class='default-value'>(Default: " + String(DO_CAL2_T, 1) + " °C)</td></tr>";
+  }
+  html += "</table>";
+  html += "<input type='submit' value='Save DO Calibration' class='button'>";
+  html += "</form>";
+  html += "</div>";
+
+  // Turbidity Calibration Section
+  html += "<div class='section'>";
+  html += "<h2>Turbidity Sensor Calibration</h2>";
+  html += "<p>Current Voltage Reading: <span id='current-turb-voltage'>" + String(turbidityVoltage * 1000.0f, 1) + "</span> mV</p>";
+  html += "<form action='/calibrate_turbidity' method='post'>";
+  html += "<table>";
+  html += "<tr><td>Clear Water Voltage (V):</td><td><input type='number' step='0.001' name='clear_water_voltage' value='" + String(clearWaterVoltage, 3) + "'></td>";
+  html += "<td class='default-value'>(Default: 1.450 V)</td></tr>";
+  html += "</table>";
+  html += "<input type='submit' value='Save Turbidity Calibration' class='button'>";
+  html += "<input type='button' value='Calibrate with Current Reading' class='button blue' onclick=\"document.getElementById('calibrate-btn').click();\">";
+  html += "</form>";
+  html += "<form action='/calibrate_turbidity_current' method='post' style='display: none;'>";
+  html += "<input type='submit' id='calibrate-btn'>";
+  html += "</form>";
+  html += "</div>";
+
+  // TDS Configuration Section
+  html += "<div class='section'>";
+  html += "<h2>TDS Sensor Configuration</h2>";
+  html += "<form action='/configure_tds' method='post'>";
+  html += "<table>";
+  html += "<tr><td>Number of Samples:</td><td><input type='number' min='1' max='100' name='tds_samples' value='" + String(tdsSampleCount) + "'></td>";
+  html += "<td class='default-value'>(Default: 30)</td></tr>";
+  html += "</table>";
+  html += "<input type='submit' value='Save TDS Configuration' class='button'>";
+  html += "</form>";
+  html += "</div>";
+
+  // Serial Command Interface
+  html += "<div class='section'>";
+  html += "<h2>Serial Command Interface</h2>";
+  html += "<form id='commandForm'>";
+  html += "<input type='text' id='commandInput' name='command' placeholder='Enter serial command' style='width: 70%; padding: 8px;'>";
+  html += "<button type='button' onclick='sendCommand()' class='button'>Send Command</button>";
+  html += "</form>";
+  html += "<div id='commandResult' style='margin-top: 10px; padding: 10px; background: #f0f0f0; border-radius: 4px; display: none;'></div>";
+  html += "<div style='margin-top: 10px;'>";
+  html += "<h3>Quick Commands:</h3>";
+  html += "<button onclick=\"sendQuickCommand('status')\" class='button'>Status</button>";
+  html += "<button onclick=\"sendQuickCommand('calibration_status')\" class='button'>Calibration Status</button>";
+  html += "<button onclick=\"sendQuickCommand('bme_status')\" class='button'>BME280 Status</button>";
+  html += "<button onclick=\"sendQuickCommand('tide_status')\" class='button'>Tide Status</button>";
+  html += "<button onclick=\"sendQuickCommand('reset_calibration')\" class='button red'>Reset Calibration</button>";
+  html += "</div>";
+  html += "</div>";
+
+  // System Actions
+  html += "<div class='section'>";
+  html += "<h2>System Actions</h2>";
+  html += "<form action='/reset_calibration' method='post'>";
+  html += "<input type='submit' value='Reset All Calibration to Defaults' class='button red'>";
+  html += "</form>";
+  html += "</div>";
+
+  html += "</body></html>";
+  server.send(200, "text/html", html);
+}
+
+void handleSensorData() {
+  String json = "{";
+  json += "\"ph\":" + String(phValue, 2) + ",";
+  json += "\"ph_voltage\":" + String(phVoltage, 1) + ",";
+  json += "\"ec\":" + String(ecValue, 2) + ",";
+  json += "\"ec_voltage\":" + String(ecVoltage, 1) + ",";
+  json += "\"do\":" + String(doValue, 2) + ",";
+  json += "\"do_voltage\":" + String(doVoltage, 1) + ",";
+  json += "\"tds\":" + String(tdsValue, 0) + ",";
+  json += "\"tds_voltage\":" + String(tdsVoltage, 4) + ",";
+  json += "\"turbidity\":" + String(turbidityValue, 1) + ",";
+  json += "\"turbidity_voltage\":" + String(turbidityVoltage, 4) + ",";
+  json += "\"temp\":" + String(temperature, 1) + ",";
+  json += "\"temp_ready\":" + String(tempSensorReady ? "true" : "false") + ",";
+  json += "\"humidity\":" + String(humidity, 1) + ",";
+  json += "\"pressure\":" + String(pressure, 5) + ",";
+  json += "\"air_temp\":" + String(airTemperature, 1) + ",";
+  json += "\"bme_ready\":" + String(bme280Ready ? "true" : "false") + ",";
+  json += "\"tide_level\":" + String(tide_level, 1);
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void handleDOCalibration() {
+  if (server.method() == HTTP_POST) {
+    doCalibration.twoPointEnabled = server.arg("do_cal_type").toInt() == 1;
+    doCalibration.cal1Voltage = server.arg("do_cal1_v").toFloat();
+    doCalibration.cal1Temp = server.arg("do_cal1_t").toFloat();
+    
+    if (doCalibration.twoPointEnabled) {
+      doCalibration.cal2Voltage = server.arg("do_cal2_v").toFloat();
+      doCalibration.cal2Temp = server.arg("do_cal2_t").toFloat();
+    }
+    
+    saveDOCalibration();
+    server.sendHeader("Location", "/");
+    server.send(303);
+  }
+}
+
+void handleTDSConfiguration() {
+  if (server.method() == HTTP_POST) {
+    int newSampleCount = server.arg("tds_samples").toInt();
+    if (newSampleCount >= 1 && newSampleCount <= 100) {
+      delete[] tdsAnalogBuffer;
+      tdsSampleCount = newSampleCount;
+      tdsAnalogBuffer = new int[tdsSampleCount];
+      for (int i = 0; i < tdsSampleCount; i++) {
+        tdsAnalogBuffer[i] = 0;
+      }
+      saveTDSConfiguration();
+    }
+    server.sendHeader("Location", "/");
+    server.send(303);
+  }
+}
+
+void handleTurbidityCalibration() {
+  if (server.method() == HTTP_POST) {
+    if (server.hasArg("clear_water_voltage")) {
+      clearWaterVoltage = server.arg("clear_water_voltage").toFloat();
+      saveTurbidityCalibration();
+    }
+    server.sendHeader("Location", "/");
+    server.send(303);
+  }
+}
+
+void handleResetCalibration() {
+  resetCalibrationToDefaults();
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n===== WATER QUALITY MONITORING SYSTEM =====");
+  Serial.println("Initializing...");
+  
+  EEPROM.begin(EEPROM_SIZE);
+  loadCalibrationData();
+  
+  if (tdsAnalogBuffer == nullptr) {
+    tdsAnalogBuffer = new int[tdsSampleCount];
+    for (int i = 0; i < tdsSampleCount; i++) {
+      tdsAnalogBuffer[i] = 0;
+    }
+  }
+  
+  Wire.begin(8, 9);
+  if (!ads.begin()) {
+    Serial.println("Failed to initialize ADS1115!");
+    while (1);
+  }
+  ads.setGain(ADS_GAIN);
+  
+  // Initialize BME280
+  setupBME280();
+  
+  tempSensor.begin();
+  analogReadResolution(12);
+  
+  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_SS);
+  LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
+  
+  Serial.print("Initializing LoRa...");
+  if (LoRa.begin(915E6)) {
+    Serial.println(" SUCCESS ✓");
+    
+    // Match receiver LoRa configuration
+    LoRa.setSpreadingFactor(7);
+    LoRa.setSignalBandwidth(250E2);
+    LoRa.setCodingRate4(5);
+    LoRa.setSyncWord(0x91);
+    LoRa.setPreambleLength(8);
+    LoRa.setTxPower(17);  // Changed from 20 to match receiver
+    LoRa.enableCrc();
+    
+    loraInitialized = true;
+  } else {
+    Serial.println(" FAILED ✗");
+    loraInitialized = false;
+  }
+  
+  setupWiFi();
+  
+  server.on("/", handleRoot);
+  server.on("/sensor_data", handleSensorData);
+  server.on("/serial_command", HTTP_POST, handleSerialCommand);
+  server.on("/calibrate_do", HTTP_POST, handleDOCalibration);
+  server.on("/configure_tds", HTTP_POST, handleTDSConfiguration);
+  server.on("/calibrate_turbidity", HTTP_POST, handleTurbidityCalibration);
+  server.on("/calibrate_turbidity_current", HTTP_POST, []() {
+    readTurbidity();
+    clearWaterVoltage = turbidityVoltage;
+    saveTurbidityCalibration();
+    server.sendHeader("Location", "/");
+    server.send(303);
+  });
+  server.on("/reset_calibration", HTTP_POST, handleResetCalibration);
+  server.on("/configure_tide", HTTP_POST, handleTideConfiguration);
+  
+  server.begin();
+  
+  Serial.println("\n===== SYSTEM READY =====");
+  Serial.println("Available commands:");
+  Serial.println("  status - Show current sensor readings");
+  Serial.println("  calibration_status - Show calibration details");
+  Serial.println("  bme_status - Show BME280 status and readings");
+  Serial.println("  tide_status - Show tide level and configuration");
+  Serial.println("  reset_calibration - Reset all calibration to defaults");
+  Serial.println("  calph_acid <voltage> <temp> - Set pH 4.0 calibration");
+  Serial.println("  calph_neutral <voltage> <temp> - Set pH 7.0 calibration");
+  Serial.println("  calec <voltage> <temp> - Set EC calibration (12.88 mS/cm)");
+  Serial.println("  caltide <ref_press> <ref_tide> <cv> - Set tide calibration");
+  Serial.println("  eeprom_dump - Show EEPROM contents");
+  Serial.print("Web interface: http://");
+  Serial.println(WiFi.softAPIP());
+}
+
+void loop() {
+  server.handleClient();
+  processSerialCommands();
+  readAllSensors();
+  printStatusSummary();
+  
+  if (millis() - lastTransmission >= TRANSMISSION_INTERVAL) {
+    sendDataPacket();
+    lastTransmission = millis();
+  }
+  
+  delay(100);
+}
