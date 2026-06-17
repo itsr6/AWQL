@@ -1,0 +1,1888 @@
+#include <Arduino.h>
+#include <SPI.h>
+#include <LoRa.h>
+#include <TFT_eSPI.h>
+#include <ArduinoJson.h>
+#include <WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include <time.h>
+
+// Firebase includes
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+// Create separate SPI instances
+SPIClass DisplaySPI(FSPI);  // SPI2 for display
+SPIClass LoRaSPI(HSPI);     // SPI3 for LoRa
+
+// Display SPI pins
+#define DISPLAY_SCK  12
+#define DISPLAY_MISO 13
+#define DISPLAY_MOSI 11
+#define DISPLAY_CS   4
+#define TFT_DC      6
+#define TFT_RST     5
+#define TFT_BL      7
+
+// LoRa SPI pins
+#define LORA_SCK    36
+#define LORA_MISO   37
+#define LORA_MOSI   35
+#define LORA_SS     15
+#define LORA_RST    17
+#define LORA_DIO0   18
+
+// Display colors
+#define BACKGROUND TFT_BLACK
+#define TEXT_COLOR TFT_WHITE
+#define VALUE_COLOR TFT_GREEN
+#define ERROR_COLOR TFT_RED
+#define TIME_COLOR TFT_CYAN
+#define DATE_COLOR TFT_YELLOW
+#define SYNC_COLOR TFT_MAGENTA
+#define PH_COLOR TFT_BLUE
+#define EC_COLOR 0xFD20
+#define DO_COLOR 0xA0FA
+#define TDS_COLOR 0xFD20
+#define RGB_COLOR 0xAFE5
+#define COD_COLOR 0xF81F
+
+// Timing constants
+#define RECEIVE_RETRY_INTERVAL 5000
+#define BOD_UPDATE_INTERVAL 60000
+#define DISPLAY_UPDATE_INTERVAL 2000
+#define DEBUG_MSG_INTERVAL 30000
+#define FIREBASE_UPLOAD_INTERVAL 600000 // Upload to Firebase every minute
+
+// NTP Server settings
+const char* ntpServer1 = "pool.ntp.org";
+const char* ntpServer2 = "time.nist.gov";
+const long gmtOffset_sec = 25200;  // GMT+7 for Indonesia (7 hours * 3600 seconds)
+const int daylightOffset_sec = 0;
+
+// Firebase and WiFi configuration
+#define API_KEY "AIzaSyCTjgXOengQjinmKz5hB7IwaLN1cVylOB"
+#define DATABASE_URL "https://awrl-49c31-default-rtdb.asia-southeast1.firebasedatabase.app/"
+#define USER_EMAIL "waterqualitylid@gmail.com"
+#define USER_PASSWORD "testsn12345"
+
+// WiFi credentials - update with your network details
+const char* ssid = "ADVAN MF01-5D1577";
+const char* password = "6AF3EC49";
+
+// Debug settings
+#define DEBUG_CRC false
+#define DEBUG_PACKET_DATA true
+#define DEBUG_LORA true
+#define DEBUG_FIREBASE true
+
+// Create display instance
+TFT_eSPI tft = TFT_eSPI();
+
+// Firebase objects
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+bool wifiInitialized = false;
+bool firebaseInitialized = false;
+bool timeInitialized = false;
+char timeStampBuf[32]; // Buffer to hold timestamp string
+
+// Data structures for sensor readings
+struct WaterLevelData {
+  float depth;            // Water depth in cm
+  uint16_t rgbR;          // Red value from RGB sensor
+  uint16_t rgbG;          // Green value from RGB sensor
+  uint16_t rgbB;          // Blue value from RGB sensor
+  uint16_t rgbC;          // Clear value from RGB sensor
+  float turbidity;        // Turbidity in NTU
+  float turbVoltage;      // Turbidity sensor voltage
+  int deviceId;           // Device ID
+  int rssi;               // Signal strength
+  unsigned long timestamp;// Time of reception
+  bool isValid;           // Flag to check if data is valid
+  uint8_t sequence;       // Sequence number
+};
+
+struct WaterQualityData {
+  // Calculated values
+  float pH;
+  float ec;               // Electrical conductivity in µS/cm
+  float do_level;         // Dissolved oxygen in mg/L
+  float do_saturation;    // DO saturation in mg/L
+  float tds;              // Total dissolved solids in ppm
+  float temperature;      // Temperature from this node (add this line back!)
+  float k;                // Reaction rate constant
+  float bod1;             // 1-day biochemical oxygen demand
+  float bod5;             // 5-day biochemical oxygen demand
+  float cod;             // 5-day chemical oxygen demand
+  
+  // Metadata
+  int deviceId;
+  int rssi;
+  unsigned long timestamp;
+  bool isValid;
+  uint8_t sequence;
+  
+  // First measurement timestamp for 10-minute BOD calculation
+  unsigned long firstMeasurementTime;
+};
+
+// Packet counters for debugging
+unsigned long receivedPacketsTotal = 0;
+unsigned long receivedPacketsNode1 = 0;
+unsigned long receivedPacketsNode2 = 0;
+unsigned long crcErrorsNode1 = 0;
+unsigned long crcErrorsNode2 = 0;
+unsigned long firebaseUploads = 0;
+unsigned long firebaseErrors = 0;
+
+// Global variables
+WaterLevelData levelData = {0};
+WaterQualityData qualityData = {0};
+
+unsigned long lastLevelDataTime = 0;
+unsigned long lastQualityDataTime = 0;
+unsigned long lastBODCalculationTime = 0;
+unsigned long startupTime = 0;
+unsigned long lastReceiveAttempt = 0;
+unsigned long lastFirebaseUpload = 0;
+unsigned long lastWiFiCheck = 0;
+unsigned long lastTimeSync = 0;
+bool loraInitialized = false;
+bool layoutInitialized = false;
+bool bodCalculated = false;
+
+// Function prototypes
+void initializeDisplay();
+void initializeDisplayLayout();
+void initializeWiFi();
+void initializeTime();
+void initializeFirebase();
+void configureLoRa();
+void updateDisplay();
+void displayDataStructure();
+void updateNodeOneDisplay();
+void updateNodeTwoDisplay();
+uint16_t calculateCRC16(uint8_t *data, size_t length);
+void flashReceivedIndicator(int x, int y, uint16_t color);
+bool getFormattedTimestamp(char* buffer, size_t bufferSize);
+void uploadToFirebase();
+bool getLatestRecord();
+bool checkAndReconnect();
+void logSystemEvent(const String& eventType, const String& message);
+
+// Calculation functions for water quality parameter
+float calculateCOD(float bod, float temperature);
+void calculateBOD();
+
+void processLevelPacket(int packetSize, int rssi);
+void processQualityPacket(int packetSize, int rssi);
+void processJsonPacket(String message, int rssi);
+void checkForPacketsWithTimeout();
+void checkLoRaStatus();
+void checkWiFiStatus();
+void printPacketHex(uint8_t *packet, int length);
+
+// Calculate Chemical Oxygen Demand (COD) from BOD and temperature
+float calculateCOD(float bod, float temperature) {
+  return 0.1011 + (6.7610 * bod) - (0.0204 * temperature);
+}
+
+// Calculate BOD values - MODIFIED for 10-minute mark calculation
+void calculateBOD() {
+  if (!qualityData.isValid || qualityData.do_level <= 0) return;
+  
+  // Record first measurement time if this is the first valid reading
+  if (qualityData.firstMeasurementTime == 0) {
+    qualityData.firstMeasurementTime = millis();
+    Serial.println("First DO measurement recorded. Will calculate BOD/COD after 10 minutes.");
+    return;
+  }
+  
+  // Check if 10 minutes have passed since first measurement
+  if ((millis() - qualityData.firstMeasurementTime) < 600000) { // 10 minutes = 600000 ms
+    unsigned long remainingTime = (600000 - (millis() - qualityData.firstMeasurementTime)) / 1000;
+    Serial.println("Waiting for BOD/COD calculation. Time remaining: " + String(remainingTime) + "s");
+    return;
+  }
+  
+  lastBODCalculationTime = millis();
+  float currentDO = qualityData.do_level;
+  float temp = qualityData.temperature > 0 ? qualityData.temperature : 25.0;
+  
+  // Calculate DO saturation based on temperature
+  qualityData.do_saturation = 14.259 * exp(-0.022 * temp);
+  
+  // Use default k value if needed
+  qualityData.k = 0.4; // Fixed k value
+  
+  // Calculate BOD values using k and DO deficit
+  float doDeficit = qualityData.do_saturation - currentDO;
+  if (doDeficit < 0) doDeficit = 0; // No deficit if DO exceeds saturation
+  
+  // BOD calculation: BOD = DO deficit / k
+  qualityData.bod1 = doDeficit / qualityData.k;
+  qualityData.bod5 = qualityData.bod1 * 1.5; // Typical BOD5/BOD1 ratio
+  
+  // Calculate COD values using the specified formula
+  qualityData.cod = calculateCOD(qualityData.bod5, temp);
+  
+  // Constrain to reasonable values
+  qualityData.bod1 = constrain(qualityData.bod1, 0, 9999);
+  qualityData.bod5 = constrain(qualityData.bod5, 0, 9999);
+  qualityData.cod = constrain(qualityData.cod, 0, 9999);
+  
+  bodCalculated = true;
+  
+  Serial.println("BOD and COD Calculated:");
+  Serial.print("  Temperature: "); 
+  Serial.print(temp, 1); 
+  Serial.println("°C");
+  
+  Serial.print("  DO Measured: "); 
+  Serial.print(currentDO, 2); 
+  Serial.println(" mg/L");
+  
+  Serial.print("  DO Saturation: "); 
+  Serial.print(qualityData.do_saturation, 2); 
+  Serial.println(" mg/L");
+  
+  Serial.print("  BOD₁: "); 
+  Serial.print(qualityData.bod1, 2); 
+  Serial.println(" mg/L");
+  
+  Serial.print("  BOD₅: "); 
+  Serial.print(qualityData.bod5, 2); 
+  Serial.println(" mg/L");
+  
+  Serial.print("  COD₅: "); 
+  Serial.print(qualityData.cod, 2); 
+  Serial.println(" mg/L");
+}
+
+// Function to initialize NTP time sync
+void initializeTime() {
+  if (wifiInitialized) {
+    Serial.println("Configuring time via NTP...");
+    
+    // Configure NTP servers
+    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer1, ntpServer2);
+    
+    // Wait for time to be set
+    time_t now = 0;
+    struct tm timeinfo;
+    int retry = 0;
+    const int maxRetry = 10;
+    
+    while (time(&now) < 1000000000 && retry < maxRetry) {
+      Serial.print(".");
+      delay(500);
+      retry++;
+    }
+    
+    if (retry < maxRetry) {
+      timeInitialized = true;
+      getLocalTime(&timeinfo);
+      Serial.println("\nTime initialized successfully!");
+      Serial.print("Current time: ");
+      Serial.println(&timeinfo, "%Y-%m-%d %H:%M:%S");
+      
+      // Display time sync status
+      tft.fillRect(0, tft.height()-35, tft.width(), 15, TFT_BLACK);
+      tft.setCursor(5, tft.height()-30);
+      tft.setTextColor(VALUE_COLOR);
+      tft.setTextSize(1);
+      tft.print("Time sync: ");
+      tft.print(&timeinfo, "%Y-%m-%d %H:%M:%S");
+    } else {
+      Serial.println("\nFailed to initialize time via NTP");
+      
+      // Display time sync failure
+      tft.fillRect(0, tft.height()-35, tft.width(), 15, TFT_BLACK);
+      tft.setCursor(5, tft.height()-30);
+      tft.setTextColor(ERROR_COLOR);
+      tft.setTextSize(1);
+      tft.print("Time sync failed!");
+    }
+    
+    lastTimeSync = millis();
+  } else {
+    Serial.println("Cannot initialize time: WiFi not connected");
+  }
+}
+
+// Function to get formatted timestamp string (YYYY-MM-DD_HH-MM-SS)
+bool getFormattedTimestamp(char* buffer, size_t bufferSize) {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    strcpy(buffer, "0000-00-00_00-00-00");
+    return false;
+  }
+  
+  strftime(buffer, bufferSize, "%Y-%m-%d_%H-%M-%S", &timeinfo);
+  return true;
+}
+
+// Initialize WiFi connection
+void initializeWiFi() {
+  Serial.println("Initializing WiFi connection...");
+  
+  // Try to connect to WiFi with the ESP32 as a station
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  
+  unsigned long startTime = millis();
+  const unsigned long timeout = 10000; // 10 seconds timeout
+  
+  tft.fillRect(0, tft.height()-35, tft.width(), 15, TFT_BLACK);
+  tft.setCursor(5, tft.height()-30);
+  tft.setTextColor(TEXT_COLOR);
+  tft.setTextSize(1);
+  tft.print("Connecting to WiFi...");
+  
+  // Wait for connection with timeout
+  while (WiFi.status() != WL_CONNECTED && millis() - startTime < timeout) {
+    delay(500);
+    Serial.print(".");
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi connected!");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+    
+    wifiInitialized = true;
+    
+    // Update display
+    tft.fillRect(0, tft.height()-35, tft.width(), 15, TFT_BLACK);
+    tft.setCursor(5, tft.height()-30);
+    tft.setTextColor(VALUE_COLOR);
+    tft.print("WiFi connected: ");
+    tft.print(WiFi.localIP());
+  } else {
+    Serial.println("\nWiFi connection failed!");
+    
+    wifiInitialized = false;
+    
+    // Update display
+    tft.fillRect(0, tft.height()-35, tft.width(), 15, TFT_BLACK);
+    tft.setCursor(5, tft.height()-30);
+    tft.setTextColor(ERROR_COLOR);
+    tft.print("WiFi connection failed!");
+  }
+  
+  lastWiFiCheck = millis();
+}
+
+// Initialize Firebase
+void initializeFirebase() {
+  if (!wifiInitialized) {
+    Serial.println("Cannot initialize Firebase: WiFi not connected");
+    return;
+  }
+  
+  Serial.println("Initializing Firebase...");
+  
+  /* Assign the API key (required) */
+  config.api_key = API_KEY;
+
+  /* Assign the RTDB URL (required) */
+  config.database_url = DATABASE_URL;
+
+  /* Sign up */
+  auth.user.email = USER_EMAIL;
+  auth.user.password = USER_PASSWORD;
+  
+  // Callback function for token status
+  config.token_status_callback = tokenStatusCallback;
+
+  // Initialize Firebase
+  Firebase.begin(&config, &auth);
+  
+  // Reconnect WiFi if needed
+  Firebase.reconnectWiFi(true);
+  
+  // Set database read timeout
+  Firebase.RTDB.setReadTimeout(&fbdo, 1000 * 60);
+  
+  // Set database write size limit
+  Firebase.RTDB.setwriteSizeLimit(&fbdo, "tiny");
+  
+  // Check if connected
+  if (Firebase.ready()) {
+    firebaseInitialized = true;
+    Serial.println("Firebase initialized successfully!");
+    
+    // Log system startup
+    logSystemEvent("startup", "System initialized with Firebase connection");
+  } else {
+    firebaseInitialized = false;
+    Serial.println("Firebase initialization failed!");
+  }
+}
+
+// Function to log system events to Firebase
+void logSystemEvent(const String& eventType, const String& message) {
+  if (!firebaseInitialized) return;
+  
+  // Get current timestamp
+  getFormattedTimestamp(timeStampBuf, sizeof(timeStampBuf));
+  String timestamp = String(timeStampBuf);
+  
+  FirebaseJson json;
+  json.set("timestamp", timestamp);
+  json.set("event", eventType);
+  json.set("message", message);
+  
+  // Create a unique path for this event
+  String eventPath = "system/logs/" + timestamp + "_" + String(random(0, 1000));
+  
+  if (Firebase.RTDB.setJSON(&fbdo, eventPath, &json)) {
+    if (DEBUG_FIREBASE) {
+      Serial.println("System event logged: " + eventType);
+    }
+  } else {
+    Serial.println("Failed to log system event: " + fbdo.errorReason());
+  }
+}
+
+// Upload data to Firebase with simplified structure
+void uploadToFirebase() {
+  if (!firebaseInitialized) {
+    Serial.println("Cannot upload: Firebase not initialized");
+    return;
+  }
+  
+  if (DEBUG_FIREBASE) {
+    Serial.println("Uploading data to Firebase...");
+  }
+  
+  // Create timestamp string
+  getFormattedTimestamp(timeStampBuf, sizeof(timeStampBuf));
+  String timestamp = String(timeStampBuf);
+  
+  if (timestamp == "0000-00-00_00-00-00") {
+    Serial.println("Warning: Using fallback timestamp (time not synchronized)");
+    // Use a fallback timestamp based on device uptime
+    timestamp = String(millis()); 
+  }
+  
+  // Only create a record if at least one of the data sets is valid
+  if (levelData.isValid || qualityData.isValid) {
+    // Create the path with the timestamp
+    // Format: water-quality/user/record/YYYY-MM-DD_HH-MM-SS
+    String recordPath = "water-quality/user/record/" + timestamp;
+    
+    FirebaseJson json;
+    json.set("timestamp", timestamp);
+    
+    // Add water level data if valid
+    if (levelData.isValid) {
+      json.set("depth", levelData.depth);
+      json.set("turbidity", levelData.turbidity);
+      
+      // Add RGB data as a combined string and individual values
+      if (levelData.rgbR > 0 || levelData.rgbG > 0 || levelData.rgbB > 0) {
+        json.set("rgb", "R" + String(levelData.rgbR) + " G" + String(levelData.rgbG) + 
+                        " B" + String(levelData.rgbB) + " C" + String(levelData.rgbC));
+        
+        // Calculate lux from RGB-C sensor (approximate calculation)
+        float luxValue = (levelData.rgbR + levelData.rgbG + levelData.rgbB) * 0.25; 
+        json.set("rgb_lux", luxValue);
+      }
+    }
+    
+    // Add water quality data if valid
+    if (qualityData.isValid) {
+      json.set("ph", qualityData.pH);
+      json.set("ec", qualityData.ec);
+      json.set("do", qualityData.do_level);
+      json.set("temp", qualityData.temperature);
+      json.set("tds", qualityData.tds);
+      
+      // Add DO saturation to the database
+      // If it's not calculated yet, calculate it here
+      float doSaturation;
+      if (bodCalculated) {
+        // Use the already calculated value if BOD has been calculated
+        doSaturation = qualityData.do_saturation;
+      } else {
+        // Calculate DO saturation based on temperature
+        // Formula: DO saturation (mg/L) = 14.59 * e^(-0.0219 * temp)
+        float temp = qualityData.temperature > 0 ? qualityData.temperature : 25.0;
+        doSaturation = 14.259 * exp(-0.022 * temp);
+      }
+      json.set("do_saturation", doSaturation);
+      
+      // Always include BOD/COD values - they'll be 0 until calculated
+      json.set("bod1", bodCalculated ? qualityData.bod1 : 0);
+      json.set("bod5", bodCalculated ? qualityData.bod5 : 0);
+      json.set("cod", bodCalculated ? qualityData.cod : 0);
+    }
+    
+    // Store the record
+    if (Firebase.RTDB.setJSON(&fbdo, recordPath, &json)) {
+      if (DEBUG_FIREBASE) {
+        Serial.println("Water quality record saved at: " + recordPath);
+      }
+      firebaseUploads++;
+    } else {
+      Serial.println("Error saving water quality record: " + fbdo.errorReason());
+      firebaseErrors++;
+    }
+  }
+  
+  lastFirebaseUpload = millis();
+}
+
+// Function to retrieve the most recent record
+bool getLatestRecord() {
+  if (!firebaseInitialized) {
+    Serial.println("Cannot retrieve latest record: Firebase not initialized");
+    return false;
+  }
+  
+  // Create a QueryFilter object first
+  QueryFilter query;
+  query.orderBy("$key");
+  query.limitToLast(1);
+  
+  // Then pass a pointer to the query object
+  if (Firebase.RTDB.getJSON(&fbdo, "water-quality/user/record", &query)) {
+    Serial.println("Latest record retrieved:");
+    Serial.println(fbdo.jsonString());
+    return true;
+  } else {
+    Serial.println("Failed to retrieve latest record: " + fbdo.errorReason());
+    return false;
+  }
+  
+  // This should never execute but keeps the compiler happy
+  return false;
+}
+
+// Function to check WiFi and Firebase connectivity
+// Returns true if reconnected successfully
+bool checkAndReconnect() {
+  bool wasReconnected = false;
+  
+  // Check WiFi connection
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi connection lost. Attempting to reconnect...");
+    
+    WiFi.reconnect();
+    
+    // Wait for reconnection with timeout
+    unsigned long startAttempt = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 10000) {
+      delay(500);
+      Serial.print(".");
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("\nWiFi reconnected!");
+      Serial.print("IP address: ");
+      Serial.println(WiFi.localIP());
+      wifiInitialized = true;
+      wasReconnected = true;
+      
+      // Sync time again after reconnection
+      initializeTime();
+    } else {
+      Serial.println("\nWiFi reconnection failed!");
+      wifiInitialized = false;
+    }
+  }
+  
+  // Check Firebase connection if WiFi is connected
+  if (wifiInitialized && !Firebase.ready()) {
+    Serial.println("Firebase connection lost. Attempting to reconnect...");
+    
+    // Initialize Firebase again
+    initializeFirebase();
+    
+    if (firebaseInitialized) {
+      Serial.println("Firebase reconnected successfully!");
+      wasReconnected = true;
+      
+      // Log reconnection event
+      logSystemEvent("reconnect", "Firebase reconnected after connection loss");
+    }
+  }
+  
+  return wasReconnected;
+}
+
+// CRC-16 calculation for packet integrity
+uint16_t calculateCRC16(uint8_t *data, size_t length) {
+  uint16_t crc = 0xFFFF;
+  
+  if (DEBUG_CRC) {
+    Serial.print("CRC Calculation for ");
+    Serial.print(length);
+    Serial.println(" bytes:");
+    
+    for (size_t i = 0; i < length; i++) {
+      Serial.print("Byte ");
+      Serial.print(i);
+      Serial.print(": 0x");
+      Serial.print(data[i], HEX);
+      Serial.print(" -> ");
+      
+      crc ^= (uint16_t)data[i];
+      
+      for (uint8_t j = 0; j < 8; j++) {
+        if (crc & 0x0001) {
+          crc = (crc >> 1) ^ 0xA001;
+        } else {
+          crc = crc >> 1;
+        }
+      }
+      
+      Serial.print("CRC: 0x");
+      Serial.println(crc, HEX);
+    }
+    
+    Serial.print("Final CRC: 0x");
+    Serial.println(crc, HEX);
+  } else {
+    for (size_t i = 0; i < length; i++) {
+      crc ^= (uint16_t)data[i];
+      
+      for (uint8_t j = 0; j < 8; j++) {
+        crc = (crc & 0x0001) ? ((crc >> 1) ^ 0xA001) : (crc >> 1);
+      }
+    }
+  }
+  
+  return crc;
+}
+
+// Print packet in hexadecimal for debugging
+void printPacketHex(uint8_t *packet, int length) {
+  Serial.println("Packet data (hex):");
+  for (int i = 0; i < length; i++) {
+    if (packet[i] < 0x10) Serial.print("0");
+    Serial.print(packet[i], HEX);
+    Serial.print(" ");
+    if ((i + 1) % 8 == 0) Serial.println();
+  }
+  Serial.println();
+}
+
+// Flashes indicator when packet received
+void flashReceivedIndicator(int x, int y, uint16_t color) {
+  tft.fillCircle(x, y, 5, color);
+  delay(50);
+  tft.fillCircle(x, y, 5, BACKGROUND);
+}
+
+// Initialize display
+void initializeDisplay() {
+  // Initialize backlight and display
+  pinMode(TFT_BL, OUTPUT);
+  digitalWrite(TFT_BL, HIGH);
+  
+  DisplaySPI.begin(DISPLAY_SCK, DISPLAY_MISO, DISPLAY_MOSI, DISPLAY_CS);
+  tft.init();
+  tft.setRotation(1);
+  tft.fillScreen(BACKGROUND);
+  
+  Serial.println("Display initialized");
+}
+
+// Initialize the static display layout
+void initializeDisplayLayout() {
+  // Clear screen
+  tft.fillScreen(BACKGROUND);
+  
+  // Top title bar
+  tft.fillRect(0, 0, tft.width(), 30, TFT_NAVY);
+  
+  // Title text at the top
+  tft.setTextColor(TFT_YELLOW);
+  tft.setTextSize(2);
+  tft.setCursor(5, 10);
+  tft.print("Water Quality Monitoring System");
+  
+  // Status bar
+  tft.fillRect(0, 30, tft.width(), 15, TFT_DARKGREY);
+  tft.setTextSize(1);
+  tft.setCursor(5, 35);
+  tft.setTextColor(TEXT_COLOR);
+  tft.print("LoRa:");
+  
+  tft.setCursor(120, 35);
+  tft.print("Updated:");
+  
+  // Add packet counter to status bar
+  tft.setCursor(220, 35);
+  tft.print("Pkts:");
+  
+  // Add Firebase status
+  tft.setCursor(300, 35);
+  tft.print("FB:");
+  
+  // Blue horizontal bands for data sections
+  tft.fillRect(0, 45, tft.width(), 20, TFT_NAVY);      // Node 1 header band
+  tft.fillRect(0, 125, tft.width(), 20, TFT_NAVY);     // Node 2 header band
+  tft.fillRect(0, tft.height()-20, tft.width(), 20, TFT_NAVY); // Footer
+  
+  // Section headers
+  tft.setTextColor(TEXT_COLOR);
+  tft.setTextSize(1);
+  
+  // Node 1 header
+  tft.setCursor(5, 50);
+  tft.print("NODE 1: WATER LEVEL Turbidity Color Sensor");
+  
+  // Node 2 header
+  tft.setCursor(5, 130);
+  tft.print("NODE 2: pH EC DO TDS TEMP");
+  
+  // Footer text
+  tft.setCursor(5, tft.height()-15);
+  tft.print("Water Quality Monitoring System ");
+  
+  layoutInitialized = true;
+}
+
+// Function to display the data structure being sent to Firebase
+void displayDataStructure() {
+  // Clear a portion of the screen for this display
+  tft.fillRect(0, 240, tft.width(), 80, TFT_BLACK);
+  
+  tft.setTextColor(TFT_YELLOW);
+  tft.setTextSize(1);
+  tft.setCursor(5, 245);
+  tft.println("Firebase Data Structure Preview:");
+  
+  // Get current timestamp
+  getFormattedTimestamp(timeStampBuf, sizeof(timeStampBuf));
+  String timestamp = String(timeStampBuf);
+  
+  tft.setTextColor(TFT_WHITE);
+  tft.setCursor(5, 255);
+  tft.print("water-quality/user/record/");
+  tft.println(timestamp);
+  
+  // Show sample of the data that would be stored
+  tft.setCursor(10, 265);
+  if (levelData.isValid) {
+    tft.print("depth: ");
+    tft.print(levelData.depth);
+    tft.print(", turbidity: ");
+    tft.print(levelData.turbidity);
+  }
+  
+  tft.setCursor(10, 275);
+  if (qualityData.isValid) {
+    tft.print("ph: ");
+    tft.print(qualityData.pH);
+    tft.print(", ec: ");
+    tft.print(qualityData.ec);
+    tft.print(", temp: ");
+    tft.print(qualityData.temperature);
+  }
+  
+  tft.setCursor(10, 285);
+  tft.print("timestamp: \"");
+  tft.print(timestamp);
+  tft.println("\"");
+}
+
+// Update Node 1 display area with simple text format
+void updateNodeOneDisplay() {
+  // Clear Node 1 data area
+  tft.fillRect(0, 65, tft.width(), 60, TFT_BLACK);
+  
+  if (!levelData.isValid) {
+    // Show offline status
+    tft.setTextColor(ERROR_COLOR);
+    tft.setTextSize(1);
+    tft.setCursor(5, 70);
+    tft.print("OFFLINE - No data from water level node");
+    return;
+  }
+  
+  // Status and time
+  unsigned long secondsSinceUpdate = (millis() - lastLevelDataTime) / 1000;
+  tft.setTextColor(VALUE_COLOR);
+  tft.setTextSize(1);
+  tft.setCursor(5, 70);
+  tft.print("Online (");
+  tft.print(secondsSinceUpdate);
+  tft.print("s ago) RSSI: ");
+  tft.print(levelData.rssi);
+  tft.print("dBm  ID:");
+  tft.print(levelData.deviceId);
+  tft.print("  Seq:");
+  tft.print(levelData.sequence);
+  
+  // Use larger text for main measurements - row 1
+  tft.setTextSize(2);
+  
+  // Depth with cm units
+  tft.setCursor(5, 90);
+  tft.setTextColor(TEXT_COLOR);
+  tft.print("Depth: ");
+  tft.setTextColor(TIME_COLOR);
+  char depthStr[8];
+  sprintf(depthStr, "%.1f", levelData.depth);
+  tft.print(depthStr);
+  tft.print(" cm");
+  
+  // Turbidity with NTU units
+  tft.setCursor(200, 90);
+  tft.setTextColor(TEXT_COLOR);
+  tft.print("Turbid: ");
+  tft.setTextColor(TFT_GREEN);
+  char turbStr[8];
+  sprintf(turbStr, "%.1f", levelData.turbidity);
+  tft.print(turbStr);
+  tft.print(" NTU");
+  
+  // RGB values - row 2 - Always show even if no sensor data
+  // Remove the condition to always show RGB values
+  tft.setTextSize(1);  // Smaller size for RGB section
+  tft.setCursor(5, 115);
+  tft.setTextColor(TEXT_COLOR);
+  tft.print("RGB Color: ");
+  
+  // RGB values
+  tft.setCursor(70, 115);
+  tft.setTextColor(TFT_RED);
+  tft.print("R:");
+  tft.print(levelData.rgbR);
+  
+  tft.setCursor(140, 115);
+  tft.setTextColor(TFT_GREEN);
+  tft.print("G:");
+  tft.print(levelData.rgbG);
+  
+  tft.setCursor(210, 115);
+  tft.setTextColor(TFT_BLUE);
+  tft.print("B:");
+  tft.print(levelData.rgbB);
+  
+  // Display Clear value - always show, will be 0 if no sensor
+  tft.setCursor(280, 115);
+  tft.setTextColor(TFT_WHITE);
+  tft.print("C:");
+  tft.print(levelData.rgbC);
+  
+  // Draw a small color swatch if RGB values are non-zero
+  if (levelData.rgbR > 0 || levelData.rgbG > 0 || levelData.rgbB > 0) {
+    uint8_t r = levelData.rgbR > 0 ? (levelData.rgbR / 257) : 0;
+    uint8_t g = levelData.rgbG > 0 ? (levelData.rgbG / 257) : 0;
+    uint8_t b = levelData.rgbB > 0 ? (levelData.rgbB / 257) : 0;
+    uint16_t rgb565 = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+    tft.fillRect(350, 105, 20, 20, rgb565);
+    tft.drawRect(350, 105, 20, 20, TFT_WHITE);
+  }
+}
+
+// UPDATED: Update Node 2 display area with box layout for all parameters
+void updateNodeTwoDisplay() {
+  // Clear Node 2 data area
+  tft.fillRect(0, 145, tft.width(), 95, TFT_BLACK);
+  
+  if (!qualityData.isValid) {
+    // Show offline status
+    tft.setTextColor(ERROR_COLOR);
+    tft.setTextSize(1);
+    tft.setCursor(5, 155);
+    tft.print("OFFLINE - No data from water quality node");
+    return;
+  }
+  
+  // Status and time - small at the top
+  unsigned long secondsSinceUpdate = (millis() - lastQualityDataTime) / 1000;
+  tft.setTextColor(VALUE_COLOR);
+  tft.setTextSize(1);
+  tft.setCursor(5, 150);
+  tft.print("Online (");
+  tft.print(secondsSinceUpdate);
+  tft.print("s ago) RSSI: ");
+  tft.print(qualityData.rssi);
+  tft.print("dBm  ID:");
+  tft.print(qualityData.deviceId);
+  tft.print("  Seq:");
+  tft.print(qualityData.sequence);
+  
+  // Layout settings for measurement boxes
+  const int BOX_WIDTH = 75;   // Width of each measurement box
+  const int BOX_HEIGHT = 40;  // Height of each measurement box
+  const int SPACING = 5;      // Spacing between boxes
+  
+  // First row starting position
+  const int ROW1_Y = 165;
+  const int ROW2_Y = ROW1_Y + BOX_HEIGHT + 15; // 15px gap between rows
+  
+  // X positions for the columns
+  const int COL1_X = 5;
+  const int COL2_X = COL1_X + BOX_WIDTH + SPACING;
+  const int COL3_X = COL2_X + BOX_WIDTH + SPACING;
+  const int COL4_X = COL3_X + BOX_WIDTH + SPACING;
+  const int COL5_X = COL4_X + BOX_WIDTH + SPACING;
+  
+  // Draw measurement boxes for first row (main parameters)
+  
+  // === BOX 1: pH ===
+  // Parameter name (top)
+  tft.setTextSize(1);
+  tft.setTextColor(TEXT_COLOR);
+  tft.setCursor(COL1_X, ROW1_Y);
+  tft.print("pH");
+  
+  // Draw box outline
+  tft.drawRect(COL1_X, ROW1_Y + 10, BOX_WIDTH, BOX_HEIGHT, TFT_DARKGREY);
+  
+  // Value (center, larger)
+  tft.setTextSize(2);
+  tft.setTextColor(PH_COLOR);
+  tft.setCursor(COL1_X + 16, ROW1_Y + 20);
+  tft.print(qualityData.pH, 1);
+  
+  // Unit (none for pH) - just for consistency
+  tft.setTextSize(1);
+  tft.setTextColor(TEXT_COLOR);
+  tft.setCursor(COL1_X + 18, ROW1_Y + 45);
+  tft.print("units");
+  
+  // === BOX 2: EC ===
+  // Parameter name
+  tft.setTextSize(1);
+  tft.setTextColor(TEXT_COLOR);
+  tft.setCursor(COL2_X, ROW1_Y);
+  tft.print("EC");
+  
+  // Draw box outline
+  tft.drawRect(COL2_X, ROW1_Y + 10, BOX_WIDTH, BOX_HEIGHT, TFT_DARKGREY);
+  
+  // Value
+  tft.setTextSize(2);
+  tft.setTextColor(EC_COLOR);
+  tft.setCursor(COL2_X + 16, ROW1_Y + 20);
+  // Convert from µS/cm to mS/cm
+  float ecValueMS = qualityData.ec;
+  tft.print(ecValueMS, 0);
+  
+  // Unit
+  tft.setTextSize(1);
+  tft.setTextColor(TEXT_COLOR);
+  tft.setCursor(COL2_X + 18, ROW1_Y + 45);
+  tft.print("uS/cm");
+  
+  // === BOX 3: DO ===
+  // Parameter name
+  tft.setTextSize(1);
+  tft.setTextColor(TEXT_COLOR);
+  tft.setCursor(COL3_X, ROW1_Y);
+  tft.print("DO");
+  
+  // Draw box outline
+  tft.drawRect(COL3_X, ROW1_Y + 10, BOX_WIDTH, BOX_HEIGHT, TFT_DARKGREY);
+  
+  // Value
+  tft.setTextSize(2);
+  tft.setTextColor(DO_COLOR);
+  tft.setCursor(COL3_X + 16, ROW1_Y + 20);
+  tft.print(qualityData.do_level, 1);
+  
+  // Unit
+  tft.setTextSize(1);
+  tft.setTextColor(TEXT_COLOR);
+  tft.setCursor(COL3_X + 18, ROW1_Y + 45);
+  tft.print("mg/L");
+  
+  // === BOX 4: TDS ===
+  // Parameter name
+  tft.setTextSize(1);
+  tft.setTextColor(TEXT_COLOR);
+  tft.setCursor(COL4_X, ROW1_Y);
+  tft.print("TDS");
+  
+  // Draw box outline
+  tft.drawRect(COL4_X, ROW1_Y + 10, BOX_WIDTH, BOX_HEIGHT, TFT_DARKGREY);
+  
+  // Value
+  tft.setTextSize(2);
+  tft.setTextColor(TDS_COLOR);
+  tft.setCursor(COL4_X + 8, ROW1_Y + 20);
+  // Show rounded value to fit in the box
+  int tdsRounded = round(qualityData.tds);
+  tft.print(tdsRounded);
+  
+  // Unit
+  tft.setTextSize(1);
+  tft.setTextColor(TEXT_COLOR);
+  tft.setCursor(COL4_X + 24, ROW1_Y + 45);
+  tft.print("ppm");
+  
+  // === BOX 5: TEMP ===
+  // Parameter name
+  tft.setTextSize(1);
+  tft.setTextColor(TEXT_COLOR);
+  tft.setCursor(COL5_X, ROW1_Y);
+  tft.print("TEMP");
+  
+  // Draw box outline
+  tft.drawRect(COL5_X, ROW1_Y + 10, BOX_WIDTH, BOX_HEIGHT, TFT_DARKGREY);
+  
+  // Value
+  tft.setTextSize(2);
+  tft.setTextColor(TIME_COLOR);
+  tft.setCursor(COL5_X + 16, ROW1_Y + 20);
+  tft.print(qualityData.temperature, 1);
+  
+  // Unit
+  tft.setTextSize(1);
+  tft.setTextColor(TEXT_COLOR);
+  tft.setCursor(COL5_X + 30, ROW1_Y + 45);
+  tft.print("°C");
+  
+  // BOD/COD Section - Second row - Always show boxes
+  // Calculate remaining time if in countdown phase
+  unsigned long remainingTime = 0;
+  unsigned int minutes = 0;
+  unsigned int seconds = 0;
+  
+  if (!bodCalculated && qualityData.firstMeasurementTime > 0) {
+    // Calculate remaining time only if first measurement recorded but not yet calculated
+    if (millis() > qualityData.firstMeasurementTime && 
+        millis() - qualityData.firstMeasurementTime < 600000) {
+      remainingTime = (600000 - (millis() - qualityData.firstMeasurementTime)) / 1000;
+      minutes = remainingTime / 60;
+      seconds = remainingTime % 60;
+    }
+  }
+  
+  // Always show the BOD/COD boxes
+  
+  // === BOX 1: BOD1 ===
+  tft.setTextSize(1);
+  tft.setTextColor(TEXT_COLOR);
+  tft.setCursor(COL1_X, ROW2_Y);
+  tft.print("BOD1");
+  
+  // Draw box outline
+  tft.drawRect(COL1_X, ROW2_Y + 10, BOX_WIDTH, BOX_HEIGHT, TFT_DARKGREY);
+  
+  // Clear value area with background color first
+  tft.fillRect(COL1_X + 1, ROW2_Y + 11, BOX_WIDTH - 2, BOX_HEIGHT - 2, BACKGROUND);
+  
+  // Value - 0.0 if not calculated yet
+  tft.setTextSize(2);
+  tft.setTextColor(DO_COLOR);
+  tft.setCursor(COL1_X + 16, ROW2_Y + 20);
+  char valueStr1[8];
+  if (bodCalculated) {
+    sprintf(valueStr1, "%.1f", qualityData.bod1);
+  } else {
+    strcpy(valueStr1, "0.0");
+  }
+  tft.print(valueStr1);
+  
+  // Unit
+  tft.setTextSize(1);
+  tft.setTextColor(TEXT_COLOR);
+  tft.setCursor(COL1_X + 18, ROW2_Y + 45);
+  tft.print("mg/L");
+  
+  // === BOX 2: BOD5 ===
+  tft.setTextSize(1);
+  tft.setTextColor(TEXT_COLOR);
+  tft.setCursor(COL2_X, ROW2_Y);
+  tft.print("BOD5");
+  
+  // Draw box outline
+  tft.drawRect(COL2_X, ROW2_Y + 10, BOX_WIDTH, BOX_HEIGHT, TFT_DARKGREY);
+  
+  // Clear value area with background color first
+  tft.fillRect(COL2_X + 1, ROW2_Y + 11, BOX_WIDTH - 2, BOX_HEIGHT - 2, BACKGROUND);
+  
+  // Value - 0.0 if not calculated yet
+  tft.setTextSize(2);
+  tft.setTextColor(DO_COLOR);
+  tft.setCursor(COL2_X + 16, ROW2_Y + 20);
+  char valueStr2[8];
+  if (bodCalculated) {
+    sprintf(valueStr2, "%.1f", qualityData.bod5);
+  } else {
+    strcpy(valueStr2, "0.0");
+  }
+  tft.print(valueStr2);
+  
+  // Unit
+  tft.setTextSize(1);
+  tft.setTextColor(TEXT_COLOR);
+  tft.setCursor(COL2_X + 18, ROW2_Y + 45);
+  tft.print("mg/L");
+  
+  // === BOX 3: COD (calculated from BOD5) ===
+  tft.setTextSize(1);
+  tft.setTextColor(TEXT_COLOR);
+  tft.setCursor(COL3_X, ROW2_Y);
+  tft.print("COD");
+  
+  // Draw box outline
+  tft.drawRect(COL3_X, ROW2_Y + 10, BOX_WIDTH, BOX_HEIGHT, TFT_DARKGREY);
+  
+  // Clear value area with background color first
+  tft.fillRect(COL3_X + 1, ROW2_Y + 11, BOX_WIDTH - 2, BOX_HEIGHT - 2, BACKGROUND);
+  
+ // Value - 0.0 if not calculated yet
+ tft.setTextSize(2);
+ tft.setTextColor(COD_COLOR);
+ tft.setCursor(COL3_X + 16, ROW2_Y + 20);
+ char valueStr3[8];
+ if (bodCalculated) {
+  // Use the already calculated COD value from qualityData
+  sprintf(valueStr3, "%.1f", qualityData.cod);
+ }else {
+  strcpy(valueStr3, "0.0");
+ }
+ tft.print(valueStr3);
+  
+  // Unit
+  tft.setTextSize(1);
+  tft.setTextColor(TEXT_COLOR);
+  tft.setCursor(COL3_X + 18, ROW2_Y + 45);
+  tft.print("mg/L");
+  
+  // Clear the message area below the BOD/COD boxes to prevent collisions
+  tft.fillRect(0, ROW2_Y + BOX_HEIGHT + 12, tft.width(), 20, TFT_BLACK);
+  
+  // Display message about BOD/COD update timing
+  if (!bodCalculated && qualityData.firstMeasurementTime > 0) {
+    // Show message below the boxes
+    tft.setTextSize(1);
+    tft.setTextColor(TIME_COLOR);
+    tft.setCursor(COL1_X, ROW2_Y + BOX_HEIGHT + 15);
+    tft.print("BOD and COD will update after 10m");
+    
+    // Optionally add elapsed time
+    unsigned long elapsedTime = (millis() - qualityData.firstMeasurementTime) / 60000; // in minutes
+    tft.setCursor(COL1_X + 240, ROW2_Y + BOX_HEIGHT + 15);
+    tft.print("(");
+    tft.print(elapsedTime);
+    tft.print("m elapsed)");
+  } else if (!bodCalculated) {
+    // If not calculating yet, show waiting message
+    tft.setTextSize(1);
+    tft.setTextColor(TIME_COLOR);
+    tft.setCursor(COL1_X, ROW2_Y + BOX_HEIGHT + 15);
+    tft.print("Waiting for first DO measurement");
+  }
+  
+  // Add signal strength bars vertically next to COD
+  if (levelData.isValid || qualityData.isValid) {
+    // Title for signal strength section
+    tft.setTextSize(1);
+    tft.setTextColor(TEXT_COLOR);
+    tft.setCursor(COL4_X, ROW2_Y);
+    tft.print("SIGNAL");
+    
+    // Draw container for signal bars
+    tft.drawRect(COL4_X, ROW2_Y + 10, BOX_WIDTH, BOX_HEIGHT, TFT_DARKGREY);
+    
+    // Draw Node 1 signal if valid
+    if (levelData.isValid) {
+      const int barHeight = 8;
+      const int barWidth = 40;
+      const int barX = COL4_X + 5;
+      const int barY1 = ROW2_Y + 15;
+      
+      tft.setTextSize(1);
+      tft.setCursor(barX, barY1);
+      tft.setTextColor(TEXT_COLOR);
+      tft.print("N1:");
+      
+      // Calculate bar width based on RSSI value (typically -30 to -120 dBm)
+      int barLength = map(constrain(levelData.rssi, -120, -30), -120, -30, 2, barWidth);
+      uint16_t barColor = levelData.rssi > -70 ? TFT_GREEN : 
+                         (levelData.rssi > -90 ? TFT_YELLOW : TFT_RED);
+      
+      // Draw signal bar
+      tft.drawRect(barX + 20, barY1, barWidth, barHeight, TEXT_COLOR);
+      tft.fillRect(barX + 20, barY1, barLength, barHeight, barColor);
+    }
+    
+    // Draw Node 2 signal if valid
+    if (qualityData.isValid) {
+      const int barHeight = 8;
+      const int barWidth = 40;
+      const int barX = COL4_X + 5;
+      const int barY2 = ROW2_Y + 30;
+      
+      tft.setTextSize(1);
+      tft.setCursor(barX, barY2);
+      tft.setTextColor(TEXT_COLOR);
+      tft.print("N2:");
+      
+      // Calculate bar width based on RSSI value
+      int barLength = map(constrain(qualityData.rssi, -120, -30), -120, -30, 2, barWidth);
+      uint16_t barColor = qualityData.rssi > -70 ? TFT_GREEN : 
+                         (qualityData.rssi > -90 ? TFT_YELLOW : TFT_RED);
+      
+      // Draw signal bar
+      tft.drawRect(barX + 20, barY2, barWidth, barHeight, TEXT_COLOR);
+      tft.fillRect(barX + 20, barY2, barLength, barHeight, barColor);
+    }
+  }
+}
+
+// Main display update function
+void updateDisplay() {
+  // If first run, initialize layout
+  if (!layoutInitialized) {
+    initializeDisplayLayout();
+  }
+  
+  // Update LoRa status
+  tft.fillRect(45, 35, 50, 10, TFT_DARKGREY);
+  tft.setCursor(45, 35);
+  if (loraInitialized) {
+    tft.setTextColor(TFT_GREEN);
+    tft.print("ONLINE");
+  } else {
+    tft.setTextColor(ERROR_COLOR);
+    tft.print("OFFLINE");
+  }
+  
+  // Update system time
+  tft.fillRect(160, 35, 40, 10, TFT_DARKGREY);
+  tft.setCursor(160, 35);
+  tft.setTextColor(TIME_COLOR);
+  tft.print(millis() / 1000);
+  tft.print("s");
+  
+  // Update packet counter
+  tft.fillRect(250, 35, 40, 10, TFT_DARKGREY);
+  tft.setCursor(250, 35);
+  tft.setTextColor(TIME_COLOR);
+  tft.print(receivedPacketsTotal);
+  
+  // Update Firebase status
+  tft.fillRect(320, 35, 80, 10, TFT_DARKGREY);
+  tft.setCursor(320, 35);
+  tft.setTextColor(firebaseInitialized ? VALUE_COLOR : ERROR_COLOR);
+  tft.print(firebaseInitialized ? "CONNECTED" : "OFFLINE");
+  
+  // Update Node 1 display
+  updateNodeOneDisplay();
+  
+  // Update Node 2 display with new parameters
+  updateNodeTwoDisplay();
+  
+  // Clear the time sync message area
+  tft.fillRect(0, tft.height()-35, tft.width(), 15, TFT_BLACK);
+  tft.setCursor(5, tft.height()-30);
+  tft.setTextSize(1);
+  
+  // Show appropriate time sync status
+  if (timeInitialized) {
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo)) {
+      tft.setTextColor(VALUE_COLOR);
+      tft.print("Time sync: ");
+      tft.print(&timeinfo, "%Y-%m-%d %H:%M:%S");
+    } else {
+      tft.setTextColor(ERROR_COLOR);
+      tft.print("Time sync error!");
+    }
+  } else {
+    tft.setTextColor(TEXT_COLOR);
+    tft.print("Time sync");
+  }
+  
+  // Update footer with timestamp
+  tft.fillRect(5, tft.height()-15, tft.width()-10, 10, TFT_NAVY);
+  tft.setCursor(5, tft.height()-15);
+  tft.setTextColor(TIME_COLOR);
+  tft.setTextSize(1);
+  
+  // Get current formatted timestamp
+  getFormattedTimestamp(timeStampBuf, sizeof(timeStampBuf));
+  
+  tft.print("Current time: ");
+  tft.print(timeStampBuf);
+  tft.print(" | Last Upload: ");
+  if (lastFirebaseUpload > 0) {
+    tft.print((millis() - lastFirebaseUpload) / 1000);
+    tft.print("s ago");
+  } else {
+    tft.print("Never");
+  }
+}
+
+// Process water level binary packet - UPDATED FOR 16-BYTE FORMAT WITH RGB
+void processLevelPacket(int packetSize, int rssi) {
+  Serial.print("Processing Node 1 level packet, ");
+  Serial.print(packetSize);
+  Serial.println(" bytes");
+  
+  // New packet size is 16 bytes - updated from the original 12 bytes
+  if (packetSize != 16) {
+    Serial.println("Error: Invalid packet size for water level data (" + String(packetSize) + " bytes)");
+    return;
+  }
+  
+  // Read packet
+  uint8_t packet[16];
+  for (int i = 0; i < packetSize; i++) {
+    packet[i] = LoRa.read();
+  }
+  
+  if (DEBUG_PACKET_DATA) {
+    printPacketHex(packet, packetSize);
+  }
+  
+  // Verify CRC
+  uint16_t receivedCRC = (packet[13] << 8) | packet[14];
+  uint16_t calculatedCRC = calculateCRC16(packet, 13);
+  
+  if (receivedCRC != calculatedCRC) {
+    Serial.println("Error: CRC check failed for water level packet");
+    Serial.print("Received: 0x");
+    Serial.print(receivedCRC, HEX);
+    Serial.print(", Calculated: 0x");
+    Serial.println(calculatedCRC, HEX);
+    crcErrorsNode1++;
+    return;
+  }
+  
+  // Extract data
+  uint8_t deviceId = packet[0];
+  
+  // Depth (2 bytes)
+  float depth = ((packet[1] << 8) | packet[2]) / 10.0;
+  
+  // Clear value from RGB sensor (2 bytes)
+  uint16_t clearValue = (packet[3] << 8) | packet[4];
+  
+  // Turbidity (2 bytes)
+  float turbidity = ((packet[5] << 8) | packet[6]) / 10.0;
+  
+  // Turbidity voltage (2 bytes)
+  float turbVoltage = ((packet[7] << 8) | packet[8]) / 1000.0;
+  
+  // RGB values (3 bytes, scaled from 0-255 to 0-65535)
+  uint16_t rgbR = packet[9] * 257;  // Scale 8-bit (0-255) to 16-bit (0-65535)
+  uint16_t rgbG = packet[10] * 257;
+  uint16_t rgbB = packet[11] * 257;
+  
+  // Sequence number (1 byte)
+  uint8_t sequence = packet[12];
+  
+  // Update current data
+  levelData.deviceId = deviceId;
+  levelData.depth = depth;
+  levelData.turbidity = turbidity;
+  levelData.turbVoltage = turbVoltage;
+  levelData.rgbR = rgbR;
+  levelData.rgbG = rgbG;
+  levelData.rgbB = rgbB;
+  levelData.rgbC = clearValue;
+  levelData.rssi = rssi;
+  levelData.timestamp = millis();
+  levelData.sequence = sequence;
+  levelData.isValid = true;
+  
+  // Check for missed packets
+  static uint8_t lastSequence = 255;
+  if (lastSequence != 255 && sequence != ((lastSequence + 1) % 256)) {
+    Serial.println("Warning: Missed " + String(((sequence - lastSequence - 1 + 256) % 256)) + " packets from Node 1");
+  }
+  lastSequence = sequence;
+  
+  lastLevelDataTime = millis();
+  receivedPacketsNode1++;
+  receivedPacketsTotal++;
+  
+  // Log data
+  Serial.println("Node 1 water level data processed successfully:");
+  Serial.println("  Depth: " + String(levelData.depth) + " cm");
+  Serial.println("  Turbidity: " + String(levelData.turbidity) + " NTU");
+  Serial.println("  RGB: R=" + String(levelData.rgbR) + 
+                 ", G=" + String(levelData.rgbG) + 
+                 ", B=" + String(levelData.rgbB) + 
+                 ", C=" + String(levelData.rgbC));
+  Serial.println("  RSSI: " + String(levelData.rssi) + " dBm");
+  Serial.println("  Sequence: " + String(levelData.sequence));
+}
+
+// Process water quality binary packet with raw voltage values
+void processQualityPacket(int packetSize, int rssi) {
+  Serial.print("Processing Node 2 quality packet, ");
+  Serial.print(packetSize);
+  Serial.println(" bytes");
+  
+  // Updated water quality packet format (18 bytes total)
+  if (packetSize != 18) {
+    Serial.println("Error: Invalid packet size for water quality data (" + String(packetSize) + " bytes)");
+    return;
+  }
+  
+  // Read packet
+  uint8_t packet[18];
+  for (int i = 0; i < packetSize; i++) {
+    packet[i] = LoRa.read();
+  }
+  
+  if (DEBUG_PACKET_DATA) {
+    printPacketHex(packet, packetSize);
+  }
+  
+  // Verify CRC
+  uint16_t receivedCRC = (packet[16] << 8) | packet[17];
+  uint16_t calculatedCRC = calculateCRC16(packet, 16);
+  
+  if (receivedCRC != calculatedCRC) {
+    Serial.println("Error: CRC check failed for water quality packet");
+    Serial.print("Received: 0x");
+    Serial.print(receivedCRC, HEX);
+    Serial.print(", Calculated: 0x");
+    Serial.println(calculatedCRC, HEX);
+    crcErrorsNode2++;
+    return;
+  }
+  
+  // Extract data
+  uint8_t deviceId = packet[0];
+  
+  // pH (2 bytes) - divided by 100 to get pH value with 2 decimal places
+  float pH = ((packet[1] << 8) | packet[2]) / 100.0;
+  
+  // EC (2 bytes) - divided by 100 to get mS/cm with 2 decimal places
+  float ec = ((packet[3] << 8) | packet[4]) / 100.0 * 1000.0; // Convert to µS/cm
+  
+  // DO (2 bytes) - divided by 100 to get mg/L with 2 decimal places
+  float doValue = ((packet[5] << 8) | packet[6]) / 100.0;
+  
+  // TDS (2 bytes) - raw ppm value
+  float tds = ((packet[7] << 8) | packet[8]);
+  
+ // Temperature (2 bytes) - divided by 100 to get °C with 2 decimal places
+ float temperature = ((int16_t)(packet[9] << 8) | packet[10]) / 100.0;
+  
+ // Sequence number (1 byte)
+ uint8_t sequence = packet[11];
+ 
+ // Status/flags (1 byte)
+ uint8_t flags = packet[12];
+ 
+ // Reserved bytes (3 bytes)
+ // packet[13], packet[14], packet[15]
+ 
+ // Direct values are available, so no need for voltage conversion
+ qualityData.pH = pH;
+ qualityData.ec = ec;
+ qualityData.do_level = doValue;
+ qualityData.tds = tds;
+ qualityData.temperature = temperature;
+ 
+ // Update metadata
+ qualityData.deviceId = deviceId;
+ qualityData.rssi = rssi;
+ qualityData.timestamp = millis();
+ qualityData.sequence = sequence;
+ qualityData.isValid = true;
+ 
+ // Check for missed packets
+ static uint8_t lastQualitySequence = 255;
+ if (lastQualitySequence != 255 && sequence != ((lastQualitySequence + 1) % 256)) {
+   Serial.println("Warning: Missed " + String(((sequence - lastQualitySequence - 1 + 256) % 256)) + " packets from Node 2");
+ }
+ lastQualitySequence = sequence;
+ 
+ lastQualityDataTime = millis();
+ receivedPacketsNode2++;
+ receivedPacketsTotal++;
+ 
+ // Calculate BOD and COD if needed
+ if (qualityData.firstMeasurementTime == 0) {
+   // First measurement - record time
+   qualityData.firstMeasurementTime = millis();
+   Serial.println("First DO measurement recorded at " + String(millis() / 1000) + "s. Will calculate BOD/COD after 10 minutes.");
+ } else if ((millis() - qualityData.firstMeasurementTime) >= 600000 && 
+            (millis() - lastBODCalculationTime > BOD_UPDATE_INTERVAL)) {
+   // If 10 minutes have passed since first measurement and update interval reached
+   calculateBOD();
+ }
+ 
+ // Log data
+ Serial.println("Node 2 water quality data processed successfully:");
+ Serial.println("  pH: " + String(qualityData.pH, 2));
+ Serial.println("  EC: " + String(qualityData.ec, 2) + " uS/cm");
+ Serial.println("  DO: " + String(qualityData.do_level, 2) + " mg/L");
+ Serial.println("  TDS: " + String(qualityData.tds, 0) + " ppm");
+ Serial.println("  Temperature: " + String(qualityData.temperature, 2) + " °C");
+ Serial.println("  RSSI: " + String(qualityData.rssi) + " dBm");
+ Serial.println("  Sequence: " + String(qualityData.sequence));
+}
+
+// Process JSON packet
+void processJsonPacket(String message, int rssi) {
+ Serial.println("Processing JSON packet: " + message);
+
+ JsonDocument doc;
+ DeserializationError error = deserializeJson(doc, message);
+
+ if (error) {
+   Serial.println("JSON parsing failed: " + String(error.c_str()));
+   return;
+ }
+
+ // Check packet type by fields
+ if (doc.containsKey("depth")) {
+   // Water level packet (Node 1) - with RGB sensor
+   levelData.depth = doc["depth"].as<float>();
+   levelData.turbidity = doc["turb_ntu"].as<float>();
+   levelData.turbVoltage = doc["turb_v"].as<float>();
+   levelData.deviceId = doc["id"] | 1;  // Default to 1 if not present
+   
+   // Check for RGB values
+   if (doc.containsKey("rgb_r")) {
+     levelData.rgbR = doc["rgb_r"].as<uint16_t>();
+     levelData.rgbG = doc["rgb_g"].as<uint16_t>();
+     levelData.rgbB = doc["rgb_b"].as<uint16_t>();
+     
+     if (doc.containsKey("rgb_c")) {
+       levelData.rgbC = doc["rgb_c"].as<uint16_t>();
+     }
+   }
+   
+   levelData.rssi = rssi;
+   levelData.timestamp = millis();
+   levelData.sequence++;
+   levelData.isValid = true;
+   
+   lastLevelDataTime = millis();
+   receivedPacketsNode1++;
+   receivedPacketsTotal++;
+ } 
+ else if (doc.containsKey("ph") || doc.containsKey("phVolt")) {
+   // Water quality packet (Node 2)
+   // Check if we have direct values or voltages
+   if (doc.containsKey("ph")) {
+     // Direct values provided
+     qualityData.pH = doc["ph"].as<float>();
+     qualityData.ec = doc["ec"].as<float>() * 1000.0; // Convert mS/cm to µS/cm
+     qualityData.do_level = doc["do"].as<float>();
+     qualityData.tds = doc["tds"].as<float>();
+     
+     // Get temperature if available
+     if (doc.containsKey("temp")) {
+       qualityData.temperature = doc["temp"].as<float>();
+     }
+   }
+   
+   qualityData.deviceId = doc["id"] | 2;  // Default to 2 if not present
+   qualityData.rssi = rssi;
+   qualityData.timestamp = millis();
+   qualityData.sequence++;
+   qualityData.isValid = true;
+   
+   lastQualityDataTime = millis();
+   receivedPacketsNode2++;
+   receivedPacketsTotal++;
+   
+   // Calculate BOD and COD if needed
+   if (qualityData.firstMeasurementTime == 0) {
+     // First measurement - record time
+     qualityData.firstMeasurementTime = millis();
+     Serial.println("First DO measurement recorded at " + String(millis() / 1000) + "s. Will calculate BOD/COD after 10 minutes.");
+   } else if ((millis() - qualityData.firstMeasurementTime) >= 600000 && 
+              (millis() - lastBODCalculationTime > BOD_UPDATE_INTERVAL)) {
+     // If 10 minutes have passed since first measurement and update interval reached
+     calculateBOD();
+   }
+ }
+}
+
+// Check for packets with timeout
+void checkForPacketsWithTimeout() {
+ unsigned long startCheck = millis();
+ const unsigned long MAX_CHECK_TIME = 500;
+ 
+ int packetSize = LoRa.parsePacket();
+ while (packetSize == 0 && (millis() - startCheck < MAX_CHECK_TIME)) {
+   packetSize = LoRa.parsePacket();
+   delay(1);
+ }
+ 
+ if (packetSize > 0) {
+   int rssi = LoRa.packetRssi();
+   
+   Serial.println("\n=== RECEIVED LORA PACKET ===");
+   Serial.println("Size: " + String(packetSize) + " bytes");
+   Serial.println("RSSI: " + String(rssi) + " dBm");
+   
+   // Process by packet size
+   if (packetSize == 16) {
+     // Water level packet (Node 1 with RGB sensors)
+     processLevelPacket(packetSize, rssi);
+     flashReceivedIndicator(tft.width()-10, 10, TFT_GREEN);
+   } 
+   else if (packetSize == 18) {
+     // Water quality packet (Node 2)
+     processQualityPacket(packetSize, rssi);
+     flashReceivedIndicator(tft.width()-20, 10, RGB_COLOR);
+   }
+   else {
+     // Try to process as JSON
+     String message = "";
+     while (LoRa.available()) {
+       message += (char)LoRa.read();
+     }
+     processJsonPacket(message, rssi);
+     flashReceivedIndicator(tft.width()-30, 10, SYNC_COLOR);
+   }
+   
+   // Update display with new data
+   updateDisplay();
+   
+   // Always put LoRa back into receive mode
+   LoRa.receive();
+ }
+}
+
+// Configure LoRa parameters
+void configureLoRa() {
+ LoRa.setSpreadingFactor(8);
+ LoRa.setSignalBandwidth(250E3);
+ LoRa.setCodingRate4(6);
+ LoRa.setSyncWord(0xF1);
+ LoRa.enableCrc();
+ LoRa.receive();
+ 
+ if (DEBUG_LORA) {
+   Serial.println("LoRa configured with parameters:");
+   Serial.println("- Spreading Factor: 8");
+   Serial.println("- Bandwidth: 250 kHz");
+   Serial.println("- Coding Rate: 4/6");
+   Serial.println("- Sync Word: 0xF1");
+   Serial.println("- CRC: Enabled");
+ }
+}
+
+// Check LoRa status and reinitialize if needed
+void checkLoRaStatus() {
+ if (!loraInitialized && (millis() - lastReceiveAttempt > RECEIVE_RETRY_INTERVAL)) {
+   Serial.println("Attempting to initialize LoRa...");
+   
+   // Reset LoRa module
+   pinMode(LORA_RST, OUTPUT);
+   digitalWrite(LORA_RST, LOW);
+   delay(20);
+   digitalWrite(LORA_RST, HIGH);
+   delay(50);
+   
+   // Initialize SPI for LoRa
+   LoRaSPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_SS);
+   LoRa.setSPI(LoRaSPI);
+   LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
+   
+   // Try with timeout
+   unsigned long startTime = millis();
+   bool success = false;
+   
+   while ((millis() - startTime) < 3000) {
+     if (LoRa.begin(915E6)) {
+       success = true;
+       break;
+     }
+     delay(100);
+   }
+   
+   if (success) {
+     loraInitialized = true;
+     configureLoRa();
+     updateDisplay();
+   }
+   
+   lastReceiveAttempt = millis();
+ } 
+ // Reset receive mode if no data for a while
+ else if (loraInitialized && 
+         (millis() - lastLevelDataTime > 30000) && 
+         (millis() - lastQualityDataTime > 30000) &&  
+         (millis() - lastReceiveAttempt > RECEIVE_RETRY_INTERVAL)) {
+   if (DEBUG_LORA) {
+     Serial.println("No data received for 30+ seconds, resetting LoRa receive mode");
+   }
+   LoRa.receive();
+   lastReceiveAttempt = millis();
+ }
+}
+
+// Check WiFi status and retry connection if needed
+void checkWiFiStatus() {
+ if (!wifiInitialized && (millis() - lastWiFiCheck > 60000)) {  // Try every minute
+   Serial.println("Attempting to reconnect WiFi...");
+   initializeWiFi();
+   
+   if (wifiInitialized && !firebaseInitialized) {
+     initializeFirebase();
+   }
+   
+   lastWiFiCheck = millis();
+ }
+}
+
+// Main setup function
+void setup() {
+ // Initialize serial
+ Serial.begin(115200);
+ delay(1000);
+ 
+ Serial.println("\n*** Water Quality Monitoring System - Receiver ***");
+ Serial.println("ESP32-S3 Optimized - Separate SPI Bus Version");
+ Serial.println("Firebase Integration with NTP Time Sync");
+ Serial.println("Build: " __DATE__ " " __TIME__);
+ 
+ // Record startup time
+ startupTime = millis();
+ 
+ // Initialize display
+ initializeDisplay();
+ initializeDisplayLayout();
+ 
+ // Initialize LoRa
+ Serial.println("Initializing LoRa module...");
+ 
+ // Reset LoRa module
+ pinMode(LORA_RST, OUTPUT);
+ digitalWrite(LORA_RST, LOW);
+ delay(20);
+ digitalWrite(LORA_RST, HIGH);
+ delay(50);
+ 
+ // Initialize SPI for LoRa
+ LoRaSPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_SS);
+ LoRa.setSPI(LoRaSPI);
+ LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
+ 
+ // Try to initialize with timeout
+ bool success = false;
+ unsigned long startAttempt = millis();
+ 
+ Serial.print("Attempting LoRa.begin(915E6)... ");
+ 
+ // Try for 5 seconds
+ while (millis() - startAttempt < 5000) {
+   if (LoRa.begin(915E6)) {
+     success = true;
+     break;
+   }
+   Serial.print(".");
+   delay(200);
+ }
+ 
+ if (success) {
+   loraInitialized = true;
+   Serial.println("\nLoRa initialized successfully!");
+   configureLoRa();
+ } else {
+   Serial.println("\nLoRa initialization timed out. Will retry later.");
+ }
+ 
+ lastReceiveAttempt = millis();
+ 
+ // Initialize WiFi
+ initializeWiFi();
+ 
+ // Initialize time if WiFi is connected
+ if (wifiInitialized) {
+   initializeTime();
+ }
+ 
+ // Initialize Firebase if WiFi is connected
+ if (wifiInitialized) {
+   initializeFirebase();
+ }
+ 
+ // Show initial screen
+ updateDisplay();
+ 
+ Serial.println("\n=== SYSTEM READY ===");
+}
+
+// Main loop function
+void loop() {
+ // Print debug message every 30 seconds
+ static unsigned long lastDebugMsg = 0;
+ if (millis() - lastDebugMsg > DEBUG_MSG_INTERVAL) {
+   Serial.println("\n----- System Status -----");
+   Serial.println("Time elapsed: " + String((millis() - startupTime) / 1000) + "s");
+   Serial.println("LoRa Status: " + String(loraInitialized ? "ONLINE" : "OFFLINE"));
+   Serial.println("WiFi Status: " + String(wifiInitialized ? "CONN=" : "DIS"));
+   Serial.println("Firebase Status: " + String(firebaseInitialized ? "CON" : "DIS"));
+   
+   // Print timestamp if time is synchronized
+   if (timeInitialized) {
+     getFormattedTimestamp(timeStampBuf, sizeof(timeStampBuf));
+     Serial.println("Current time: " + String(timeStampBuf));
+   }
+   
+   Serial.println("Packets: Total=" + String(receivedPacketsTotal) + 
+                  ", Node1=" + String(receivedPacketsNode1) + 
+                  ", Node2=" + String(receivedPacketsNode2));
+   Serial.println("CRC Errors: Node1=" + String(crcErrorsNode1) + 
+                  ", Node2=" + String(crcErrorsNode2));
+   Serial.println("Firebase: Uploads=" + String(firebaseUploads) + 
+                  ", Errors=" + String(firebaseErrors));
+   
+   // Force LoRa back to receive mode
+   if (loraInitialized) {
+     LoRa.receive();
+     Serial.println("LoRa receive mode refreshed");
+   }
+   
+   lastDebugMsg = millis();
+ }
+ 
+ // Check LoRa status and try to reinitialize if needed
+ checkLoRaStatus();
+ 
+ // Check WiFi status and try to reconnect if needed
+ checkWiFiStatus();
+ 
+ // Check for connection issues and try to reconnect
+ checkAndReconnect();
+ 
+ // Check for packets with timeout
+ checkForPacketsWithTimeout();
+ 
+ // Calculate BOD periodically if we have quality data
+ if (qualityData.isValid && qualityData.firstMeasurementTime > 0 && 
+     (millis() - qualityData.firstMeasurementTime) >= 600000 && 
+     (millis() - lastBODCalculationTime > BOD_UPDATE_INTERVAL)) {
+   calculateBOD();
+ }
+ 
+ // Upload data to Firebase periodically
+ if (firebaseInitialized && (millis() - lastFirebaseUpload > FIREBASE_UPLOAD_INTERVAL)) {
+   if (levelData.isValid || qualityData.isValid) {
+     uploadToFirebase();
+   }
+ }
+ 
+ // Check if time needs to be resynced (every 24 hours)
+ if (wifiInitialized && (millis() - lastTimeSync > 86400000)) { // 24 hours
+   initializeTime();
+ }
+ 
+ // Update display periodically
+ static unsigned long lastDisplayUpdate = 0;
+ if (millis() - lastDisplayUpdate > DISPLAY_UPDATE_INTERVAL) {
+   updateDisplay();
+   lastDisplayUpdate = millis();
+ }
+ 
+ // delay to prevent CPU overload
+ delay(10);
+}

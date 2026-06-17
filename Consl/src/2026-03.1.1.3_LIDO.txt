@@ -1,0 +1,1098 @@
+#include <Arduino.h>
+#include <SPI.h>
+#include <LoRa.h>
+#include <TFT_eSPI.h>
+#include <ArduinoJson.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <WebServer.h>
+#include <HTTPClient.h>
+#include <Update.h>
+#include <EEPROM.h>
+#include <time.h>
+
+// Firmware Information
+#define FIRMWARE_NAME    "AWQ-RX_LIDO"
+#define FIRMWARE_VERSION ".2026-03.1.1.3"
+#define FIRMWARE_AUTHOR  "Dep.Instrumen"
+#define DEVICE_ID        "Awq"
+
+// SPI instances
+SPIClass DisplaySPI(FSPI);
+SPIClass LoRaSPI(HSPI);
+
+// Display SPI pins
+#define DISPLAY_SCK  12
+#define DISPLAY_MISO 13
+#define DISPLAY_MOSI 11
+#define DISPLAY_CS    4
+#define TFT_DC        6
+#define TFT_RST       5
+#define TFT_BL        7
+
+// LoRa SPI pins
+#define LORA_SCK    36
+#define LORA_MISO   37
+#define LORA_MOSI   35
+#define LORA_SS     15
+#define LORA_RST    17
+#define LORA_DIO0   18
+
+// Display colors
+#define BACKGROUND  TFT_BLACK
+#define TEXT_COLOR  TFT_WHITE
+#define VALUE_COLOR TFT_GREEN
+#define ERROR_COLOR TFT_RED
+#define TIME_COLOR  TFT_CYAN
+#define DATE_COLOR  TFT_YELLOW
+#define SYNC_COLOR  TFT_MAGENTA
+#define PH_COLOR    TFT_BLUE
+#define EC_COLOR    0xFD20
+#define DO_COLOR    0xA0FA
+#define TDS_COLOR   0xFD20
+#define RGB_COLOR   0xAFE5
+#define COD_COLOR   0xF81F
+
+// Timing constants
+#define RECEIVE_RETRY_INTERVAL  5000
+#define BOD_UPDATE_INTERVAL     60000
+#define DISPLAY_UPDATE_INTERVAL 2000
+#define DEBUG_MSG_INTERVAL      30000
+#define DEFAULT_UPDATE_INTERVAL 20000
+
+// EEPROM layout
+#define EEPROM_SIZE          256
+#define ADDR_WIFI_SSID         0   // 32 bytes
+#define ADDR_WIFI_PASS        32   // 32 bytes
+#define ADDR_AP_PASS          64   // 32 bytes
+#define ADDR_SERVER_HOST      96   // 64 bytes
+#define ADDR_SERVER_PATH     160   // 32 bytes
+#define ADDR_SERVER_PORT     192   // 2  bytes
+#define ADDR_UPDATE_INTERVAL 194   // 4  bytes
+#define MAX_CRED_LENGTH       32
+#define MAX_HOST_LENGTH       64
+#define MAX_PATH_LENGTH       32
+
+// NTP
+const char* ntpServer1         = "pool.ntp.org";
+const char* ntpServer2         = "time.nist.gov";
+const long  gmtOffset_sec      = 25200;   // GMT+7
+const int   daylightOffset_sec = 0;
+
+// AP (always-on access point)
+const char* ap_ssid = "AWQ-RX_Config";      // fixed AP name
+String      ap_pass = "1234567890";     // loaded from EEPROM
+
+// STA WiFi + server (loaded from EEPROM)
+String sta_ssid     = "";
+String sta_password = "";
+String serverHost   = "";
+String serverPath   = "";
+int    serverPort   = 0;
+unsigned long serverUpdateInterval = DEFAULT_UPDATE_INTERVAL;
+
+// Debug flags
+#define DEBUG_CRC         false
+#define DEBUG_PACKET_DATA true
+#define DEBUG_LORA        true
+#define DEBUG_SERVER      true
+
+// Global objects
+TFT_eSPI  tft = TFT_eSPI();
+WebServer server(80);
+
+// State flags
+bool wifiSTAConnected  = false;
+bool timeInitialized   = false;
+bool loraInitialized   = false;
+bool layoutInitialized = false;
+bool bodCalculated     = false;
+char timeStampBuf[32];
+
+String lastServerStatus = "Not configured";
+bool   serverConnected  = false;
+unsigned long lastServerSend    = 0;
+unsigned long lastServerAttempt = 0;
+
+// Single sensor data struct — one TX node sends everything in one 26-byte packet:
+// [0-3]  pH float  [4-7] EC float mS/cm  [8-11] DO float mg/L
+// [12-15] TDS float ppm  [16-19] Temp float °C  [20-23] Depth float cm
+// [24] DeviceID uint8   [25] Seq uint8
+// CRC-16 covers bytes [0..23] (not stored in struct)
+struct SensorData {
+  float   pH;
+  float   ec;            // stored as µS/cm (×1000 from TX mS/cm)
+  float   do_level;
+  float   do_saturation;
+  float   tds;
+  float   temperature;
+  float   depth;
+  float   k;
+  float   bod1, bod5, cod;
+  int     deviceId;
+  int     rssi;
+  unsigned long timestamp;
+  bool    isValid;
+  uint8_t sequence;
+  unsigned long firstMeasurementTime;
+};
+
+// Counters
+unsigned long receivedPacketsTotal = 0;
+unsigned long crcErrors            = 0;
+unsigned long serverUploads        = 0;
+unsigned long serverErrors         = 0;
+
+// Global sensor state — single node
+SensorData sensorData = {0};
+
+unsigned long lastDataTime           = 0;
+unsigned long lastBODCalculationTime = 0;
+unsigned long startupTime            = 0;
+unsigned long lastReceiveAttempt     = 0;
+unsigned long lastTimeSync           = 0;
+
+// Function prototypes
+void readWiFiCredentials();
+void readAPPassword();
+void readServerConfig();
+void saveWiFiCredentials(String ssid, String password, String ap_p);
+void saveServerConfig(String host, String path, int port, unsigned long interval);
+void initializeWiFi();
+void checkWiFiConnection();
+void initializeTime();
+bool getFormattedTimestamp(char* buffer, size_t bufferSize);
+unsigned long getEpochTime();
+void uploadToServer();
+void handleRoot();
+void handleReadings();
+void handleWiFiConfig();
+void handleSaveSTA();
+void handleSaveAP();
+void handleSaveServer();
+void handleOTAUpdate();
+void handleOTAUpload();
+String generatePasswordField(const String& id, const String& value, const String& label);
+String generateStatusHtml();
+void configureLoRa();
+void checkLoRaStatus();
+void checkForPacketsWithTimeout();
+void processPacket(int packetSize, int rssi);
+uint16_t calculateCRC16(uint8_t *data, size_t length);
+void printPacketHex(uint8_t *packet, int length);
+void initializeDisplay();
+void initializeDisplayLayout();
+void updateDisplay();
+void updateSensorDisplay();
+void flashReceivedIndicator(int x, int y, uint16_t color);
+float calculateCOD(float bod, float temperature);
+void  calculateBOD();
+
+//  EEPROM helpers
+void readWiFiCredentials() {
+  char ssid_buf[MAX_CRED_LENGTH] = {0};
+  char pass_buf[MAX_CRED_LENGTH] = {0};
+  for (int i = 0; i < MAX_CRED_LENGTH; i++) {
+    ssid_buf[i] = EEPROM.read(ADDR_WIFI_SSID + i);
+    pass_buf[i] = EEPROM.read(ADDR_WIFI_PASS + i);
+  }
+  sta_ssid     = String(ssid_buf); sta_ssid.trim();
+  sta_password = String(pass_buf); sta_password.trim();
+  Serial.println("STA SSID: " + (sta_ssid.isEmpty() ? "(none)" : sta_ssid));
+}
+
+void readAPPassword() {
+  char buf[MAX_CRED_LENGTH] = {0};
+  bool valid = false;
+  for (int i = 0; i < MAX_CRED_LENGTH; i++) {
+    buf[i] = EEPROM.read(ADDR_AP_PASS + i);
+    if (buf[i] != 0 && buf[i] != 255) valid = true;
+  }
+  ap_pass = String(buf); ap_pass.trim();
+  if (!valid || ap_pass.length() < 8) {
+    ap_pass = ap_pass;
+    for (int i = 0; i < (int)ap_pass.length(); i++)
+      EEPROM.write(ADDR_AP_PASS + i, ap_pass[i]);
+    EEPROM.commit();
+  }
+}
+
+void readServerConfig() {
+  char host_buf[MAX_HOST_LENGTH] = {0};
+  char path_buf[MAX_PATH_LENGTH] = {0};
+  for (int i = 0; i < MAX_HOST_LENGTH; i++) host_buf[i] = EEPROM.read(ADDR_SERVER_HOST + i);
+  for (int i = 0; i < MAX_PATH_LENGTH;  i++) path_buf[i] = EEPROM.read(ADDR_SERVER_PATH + i);
+  serverHost = String(host_buf); serverHost.trim();
+  serverPath = String(path_buf); serverPath.trim();
+  serverPort = EEPROM.read(ADDR_SERVER_PORT) | (EEPROM.read(ADDR_SERVER_PORT+1) << 8);
+  unsigned long iv = 0;
+  for (int i = 0; i < 4; i++) iv |= ((unsigned long)EEPROM.read(ADDR_UPDATE_INTERVAL+i) << (i*8));
+  if (iv == 0xFFFFFFFF || iv < 1000 || iv > 86400000) serverUpdateInterval = DEFAULT_UPDATE_INTERVAL;
+  else serverUpdateInterval = iv;
+  if (serverHost.isEmpty() || serverPath.isEmpty() || serverPort <= 0)
+    lastServerStatus = "Not configured – set up via web UI";
+  else
+    Serial.printf("Server: %s:%d%s  interval:%lus\n", serverHost.c_str(), serverPort, serverPath.c_str(), serverUpdateInterval/1000);
+}
+
+void saveWiFiCredentials(String ssid, String password, String ap_p) {
+  for (int i = 0; i < MAX_CRED_LENGTH; i++) {
+    EEPROM.write(ADDR_WIFI_SSID+i, 0);
+    EEPROM.write(ADDR_WIFI_PASS+i, 0);
+    if (!ap_p.isEmpty()) EEPROM.write(ADDR_AP_PASS+i, 0);
+  }
+  for (int i = 0; i < (int)ssid.length()     && i < MAX_CRED_LENGTH; i++) EEPROM.write(ADDR_WIFI_SSID+i, ssid[i]);
+  for (int i = 0; i < (int)password.length() && i < MAX_CRED_LENGTH; i++) EEPROM.write(ADDR_WIFI_PASS+i, password[i]);
+  if (!ap_p.isEmpty())
+    for (int i = 0; i < (int)ap_p.length() && i < MAX_CRED_LENGTH; i++) EEPROM.write(ADDR_AP_PASS+i, ap_p[i]);
+  EEPROM.commit();
+  sta_ssid = ssid; sta_password = password;
+}
+
+void saveServerConfig(String host, String path, int port, unsigned long interval) {
+  for (int i = 0; i < MAX_HOST_LENGTH; i++) EEPROM.write(ADDR_SERVER_HOST+i, 0);
+  for (int i = 0; i < MAX_PATH_LENGTH;  i++) EEPROM.write(ADDR_SERVER_PATH+i, 0);
+  for (int i = 0; i < (int)host.length() && i < MAX_HOST_LENGTH; i++) EEPROM.write(ADDR_SERVER_HOST+i, host[i]);
+  for (int i = 0; i < (int)path.length() && i < MAX_PATH_LENGTH;  i++) EEPROM.write(ADDR_SERVER_PATH+i, path[i]);
+  EEPROM.write(ADDR_SERVER_PORT,     port & 0xFF);
+  EEPROM.write(ADDR_SERVER_PORT+1, (port >> 8) & 0xFF);
+  for (int i = 0; i < 4; i++) EEPROM.write(ADDR_UPDATE_INTERVAL+i, (interval>>(i*8))&0xFF);
+  EEPROM.commit();
+  serverHost = host; serverPath = path; serverPort = port; serverUpdateInterval = interval;
+  Serial.printf("Server saved: %s:%d%s  interval:%lus\n", host.c_str(), port, path.c_str(), interval/1000);
+}
+
+//  Time
+void initializeTime() {
+  if (!wifiSTAConnected) return;
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer1, ntpServer2);
+  time_t now = 0; int retry = 0;
+  while (time(&now) < 1000000000 && retry < 10) { delay(500); retry++; }
+  if (retry < 10) { timeInitialized = true; Serial.println("NTP time OK!"); }
+  lastTimeSync = millis();
+}
+
+bool getFormattedTimestamp(char* buffer, size_t bufferSize) {
+  struct tm ti;
+  if (!getLocalTime(&ti)) { strcpy(buffer, "0000-00-00_00:00:00"); return false; }
+  strftime(buffer, bufferSize, "%Y-%m-%d_%H:%M:%S", &ti);
+  return true;
+}
+
+unsigned long getEpochTime() { time_t now; time(&now); return (unsigned long)now; }
+
+//  WiFi
+void initializeWiFi() {
+  Serial.println("Initializing WiFi...");
+  WiFi.mode(WIFI_AP_STA);
+  if (!WiFi.softAP(ap_ssid, ap_pass.c_str())) WiFi.softAP(ap_ssid, "klhk1234");
+  Serial.println("AP: " + String(ap_ssid) + " @ " + WiFi.softAPIP().toString());
+
+  if (sta_ssid.isEmpty()) { Serial.println("No STA credentials – AP only."); return; }
+
+  WiFi.begin(sta_ssid.c_str(), sta_password.c_str());
+  WiFi.setTxPower(WIFI_POWER_8_5dBm);
+  unsigned long t = millis();
+  while (WiFi.status() != WL_CONNECTED && millis()-t < 10000) { delay(500); Serial.print("."); }
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiSTAConnected = true;
+    Serial.println("\nSTA connected: " + WiFi.localIP().toString());
+    initializeTime();
+  } else {
+    wifiSTAConnected = false;
+    Serial.println("\nSTA connection failed – AP only.");
+  }
+}
+
+void checkWiFiConnection() {
+  static unsigned long lastCheck = 0;
+  if (millis()-lastCheck < 30000) return;
+  lastCheck = millis();
+  if (WiFi.status() != WL_CONNECTED) {
+    wifiSTAConnected = false;
+    WiFi.reconnect();
+    unsigned long t = millis();
+    while (WiFi.status() != WL_CONNECTED && millis()-t < 10000) { delay(500); }
+    if (WiFi.status() == WL_CONNECTED) {
+      wifiSTAConnected = true;
+      Serial.println("WiFi STA reconnected!");
+      if (!timeInitialized) initializeTime();
+    }
+  }
+}
+
+//  Server upload
+void uploadToServer() {
+  if (!wifiSTAConnected)                                                { lastServerStatus = "WiFi not connected"; return; }
+  if (serverHost.isEmpty() || serverPath.isEmpty() || serverPort <= 0) { lastServerStatus = "Server not configured"; return; }
+  if (millis()-lastServerAttempt < serverUpdateInterval)               return;
+  lastServerAttempt = millis();
+  if (!sensorData.isValid)                                             { lastServerStatus = "No sensor data yet"; return; }
+
+  DynamicJsonDocument doc(512);
+  doc["device_id"]         = DEVICE_ID;
+  doc["epoch_time"]        = getEpochTime();
+  doc["water_depth"]       = sensorData.depth;
+  doc["do"]                = sensorData.do_level;
+  doc["ph"]                = sensorData.pH;
+  doc["ec"]                = sensorData.ec;
+  doc["tds"]               = sensorData.tds;
+  doc["water_temperature"] = sensorData.temperature;
+
+  String body; serializeJson(doc, body);
+  bool   useSSL = (serverPort == 443);
+  String url    = (useSSL ? "https://" : "http://") + serverHost + ":" + String(serverPort) + serverPath;
+
+  if (DEBUG_SERVER) { Serial.println("Upload: " + url); Serial.println(body); }
+
+  WiFiClient       plain;
+  WiFiClientSecure secure;
+  HTTPClient       http;
+  bool begun = useSSL ? (secure.setInsecure(), http.begin(secure, url)) : http.begin(plain, url);
+
+  if (!begun) { lastServerStatus = "Connection failed"; serverConnected=false; serverErrors++; http.end(); return; }
+
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("X-Firmware-Version", FIRMWARE_VERSION);
+  http.setTimeout(10000);
+
+  int code = http.POST(body);
+  if (DEBUG_SERVER) Serial.printf("HTTP %d\n", code);
+
+  if (code == 200 || code == 201) {
+    lastServerStatus = "OK (HTTP " + String(code) + ")";
+    serverConnected = true; lastServerSend = millis(); serverUploads++;
+  } else if (code < 0) {
+    lastServerStatus = "Error: " + http.errorToString(code);
+    serverConnected = false; serverErrors++;
+  } else {
+    lastServerStatus = "HTTP " + String(code);
+    serverConnected = false; serverErrors++;
+    if (DEBUG_SERVER) Serial.println(http.getString());
+  }
+  http.end();
+}
+
+//  Web server handlers  (transplanted from example code)
+String generatePasswordField(const String& id, const String& value, const String& label) {
+  String h = "<label for='" + id + "'>" + label + ":</label>";
+  h += "<div style='display:flex;align-items:center;'>";
+  h += "<input type='password' id='" + id + "' name='" + id + "' value='" + value + "' style='flex-grow:1;'>";
+  h += "<button type='button' onclick=\"togglePassword('" + id + "')\" style='margin-left:5px;'>Show</button>";
+  h += "</div>";
+  return h;
+}
+
+String generateStatusHtml() {
+  getFormattedTimestamp(timeStampBuf, sizeof(timeStampBuf));
+  String h = "<div class='reading'><h3>Sensor Data</h3><table>";
+  h += "<tr><td>Device:</td><td>" DEVICE_ID " | v" FIRMWARE_VERSION "</td></tr>";
+  h += "<tr><td>Time:</td><td>" + String(timeStampBuf) + "</td></tr>";
+
+  if (sensorData.isValid) {
+    unsigned long age = (millis()-lastDataTime)/1000;
+    h += "<tr><td>Node:</td><td>ID:" + String(sensorData.deviceId) + " | Seq:" + String(sensorData.sequence) + " | " + String(age) + "s ago</td></tr>";
+    h += "<tr><td>Depth:</td><td>"       + String(sensorData.depth,       2) + " cm</td></tr>";
+    h += "<tr><td>pH:</td><td>"          + String(sensorData.pH,          2) + "</td></tr>";
+    h += "<tr><td>EC:</td><td>"          + String(sensorData.ec,          2) + " µS/cm</td></tr>";
+    h += "<tr><td>DO:</td><td>"          + String(sensorData.do_level,    2) + " mg/L</td></tr>";
+    h += "<tr><td>TDS:</td><td>"         + String(sensorData.tds,         0) + " ppm</td></tr>";
+    h += "<tr><td>Temperature:</td><td>" + String(sensorData.temperature, 2) + " °C</td></tr>";
+    h += "<tr><td>BOD1:</td><td>"  + (bodCalculated ? String(sensorData.bod1,2)+" mg/L" : "pending 10 min") + "</td></tr>";
+    h += "<tr><td>BOD5:</td><td>"  + (bodCalculated ? String(sensorData.bod5,2)+" mg/L" : "pending 10 min") + "</td></tr>";
+    h += "<tr><td>COD:</td><td>"   + (bodCalculated ? String(sensorData.cod, 2)+" mg/L" : "pending 10 min") + "</td></tr>";
+  } else {
+    h += "<tr><td colspan='2' style='color:red;'>Node OFFLINE – waiting for data</td></tr>";
+  }
+  h += "</table></div>";
+
+  h += "<div class='reading'><h3>Server</h3><table>";
+  h += "<tr><td>Host:</td><td>"     + (serverHost.isEmpty() ? "Not configured" : serverHost) + "</td></tr>";
+  h += "<tr><td>Path:</td><td>"     + (serverPath.isEmpty() ? "Not configured" : serverPath) + "</td></tr>";
+  h += "<tr><td>Port:</td><td>"     + (serverPort==0 ? String("Not configured") : String(serverPort)) + "</td></tr>";
+  h += "<tr><td>Interval:</td><td>" + String(serverUpdateInterval/1000) + " s</td></tr>";
+  h += "<tr><td>Status:</td><td>"   + lastServerStatus + "</td></tr>";
+  h += "<tr><td>Uploads:</td><td>"  + String(serverUploads) + " | Errors: " + String(serverErrors) + "</td></tr>";
+  if (lastServerSend > 0) h += "<tr><td>Last send:</td><td>" + String((millis()-lastServerSend)/1000) + "s ago</td></tr>";
+  h += "</table></div>";
+
+  h += "<div class='reading'><h3>Network</h3><table>";
+  h += "<tr><td>STA:</td><td>" + String(wifiSTAConnected ? "Connected – "+WiFi.localIP().toString() : "Disconnected") + "</td></tr>";
+  if (wifiSTAConnected) h += "<tr><td>RSSI:</td><td>" + String(WiFi.RSSI()) + " dBm</td></tr>";
+  h += "<tr><td>AP:</td><td>" + String(ap_ssid) + " @ " + WiFi.softAPIP().toString() + "</td></tr>";
+  h += "<tr><td>AP Clients:</td><td>" + String(WiFi.softAPgetStationNum()) + "</td></tr>";
+  h += "</table></div>";
+
+  h += "<div class='reading'><h3>LoRa</h3><table>";
+  h += "<tr><td>Status:</td><td>" + String(loraInitialized?"Online":"Offline") + "</td></tr>";
+  h += "<tr><td>Packets RX:</td><td>" + String(receivedPacketsTotal) + " | CRC err: " + String(crcErrors) + "</td></tr>";
+
+  auto signalBars = [](int rssi, bool valid) -> String {
+    String s = "<span style='display:inline-flex;align-items:flex-end;gap:2px;height:18px;'>";
+    int heights[4]    = {5, 8, 12, 18};
+    int thresholds[4] = {-110, -90, -70, -55};
+    for (int i = 0; i < 4; i++) {
+      bool lit = valid && (rssi >= thresholds[i]);
+      String col = lit ? (rssi >= -55 ? "#4CAF50" : rssi >= -70 ? "#8BC34A" : rssi >= -90 ? "#FFC107" : "#F44336") : "#ccc";
+      s += "<span style='display:inline-block;width:7px;height:" + String(heights[i]) + "px;background:" + col + ";border-radius:1px;'></span>";
+    }
+    s += "</span>";
+    return s;
+  };
+  String rssiStr = sensorData.isValid ? " " + String(sensorData.rssi) + " dBm" : " --";
+  h += "<tr><td>Signal:</td><td>" + signalBars(sensorData.rssi, sensorData.isValid) + rssiStr + "</td></tr>";
+  h += "</table></div>";
+  return h;
+}
+
+void handleRoot() {
+  String html = "<!DOCTYPE html><html><head>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<title>KA-LIDO Monitor</title>";
+  html += "<style>body{font-family:Arial,sans-serif;max-width:700px;margin:0 auto;padding:20px;}";
+  html += ".reading{background:#f0f0f0;padding:15px;margin:15px 0;border-radius:8px;}";
+  html += "table{width:100%;border-collapse:collapse;}td{padding:6px 8px;border:1px solid #ddd;}";
+  html += ".button{background:#4CAF50;color:white;padding:10px 20px;border:none;border-radius:4px;cursor:pointer;margin:4px;text-decoration:none;display:inline-block;}";
+  html += ".button.secondary{background:#2196F3;}.button.danger{background:#f44336;}";
+  html += ".status{padding:10px;margin:10px 0;border-radius:4px;}.error{background:#f2dede;color:#a94442;}</style>";
+  html += "<script>function updateReadings(){fetch('/readings').then(r=>r.text()).then(d=>{document.getElementById('readings').innerHTML=d;}).catch(e=>console.log(e));}setInterval(updateReadings,5000);window.onload=updateReadings;</script>";
+  html += "</head><body>";
+  html += "<h1>Water Quality Monitor</h1>";
+  html += "<p style='color:#666;font-size:.9em;'>v" FIRMWARE_VERSION " | " DEVICE_ID " | Auto-refreshes every 5s</p>";
+  if (serverHost.isEmpty() || serverPath.isEmpty() || serverPort <= 0)
+    html += "<div class='status error'><strong>Server not configured!</strong> <a href='/wifi-config'>Configure here</a>.</div>";
+  html += "<div id='readings'>" + generateStatusHtml() + "</div>";
+  html += "<div class='reading'><a href='/wifi-config' class='button secondary'>WiFi / Server / OTA</a> ";
+  html += "<a href='/' class='button'>Refresh</a></div>";
+  html += "</body></html>";
+  server.send(200, "text/html", html);
+}
+
+void handleReadings() {
+  server.send(200, "text/html", generateStatusHtml());
+}
+
+void handleWiFiConfig() {
+  String html = "<!DOCTYPE html><html><head>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<title>Configuration – KA-LIDO</title>";
+  html += "<style>body{font-family:Arial,sans-serif;max-width:650px;margin:0 auto;padding:20px;}";
+  html += ".config-form{background:#f0f0f0;padding:20px;margin:20px 0;border-radius:8px;}";
+  html += "input[type='text'],input[type='password'],input[type='number']{width:100%;padding:8px;margin:6px 0;box-sizing:border-box;}";
+  html += ".button{background:#4CAF50;color:white;padding:10px 20px;border:none;border-radius:4px;cursor:pointer;margin:4px;}";
+  html += ".button.secondary{background:#2196F3;}.button.danger{background:#f44336;}.button.server{background:#9C27B0;}";
+  html += ".status{padding:10px;margin:10px 0;border-radius:4px;}.success{background:#dff0d8;color:#3c763d;}.error{background:#f2dede;color:#a94442;}.info{background:#d9edf7;color:#31708f;}";
+  html += ".tab{overflow:hidden;border:1px solid #ccc;background:#f1f1f1;}";
+  html += ".tab button{background:inherit;float:left;border:none;cursor:pointer;padding:10px 16px;transition:.3s;}";
+  html += ".tab button:hover{background:#ddd;}.tab button.active{background:#ccc;}";
+  html += ".tabcontent{display:none;padding:10px;border:1px solid #ccc;border-top:none;}";
+  html += "</style><script>";
+  html += "function togglePassword(id){var x=document.getElementById(id);x.type=x.type==='password'?'text':'password';}";
+  html += "function openTab(evt,t){var i,tc,tb;tc=document.getElementsByClassName('tabcontent');for(i=0;i<tc.length;i++)tc[i].style.display='none';tb=document.getElementsByClassName('tabbutton');for(i=0;i<tb.length;i++)tb[i].className=tb[i].className.replace(' active','');document.getElementById(t).style.display='block';evt.currentTarget.className+=' active';}";
+  html += "</script></head><body><h1>Configuration</h1>";
+
+  if      (server.hasArg("sta_saved"))    html += "<div class='status success'>WiFi credentials saved! Reconnecting...</div>";
+  else if (server.hasArg("ap_saved"))     html += "<div class='status success'>AP password updated!</div>";
+  else if (server.hasArg("server_saved")) html += "<div class='status success'>Server configuration saved!</div>";
+
+  if (serverHost.isEmpty() || serverPath.isEmpty() || serverPort <= 0)
+    html += "<div class='status error'><strong>Server not configured!</strong></div>";
+
+  html += "<div class='tab'>";
+  html += "<button class='tabbutton active' onclick=\"openTab(event,'STA')\">WiFi</button>";
+  html += "<button class='tabbutton' onclick=\"openTab(event,'AP')\">AP</button>";
+  html += "<button class='tabbutton' onclick=\"openTab(event,'SERVER')\">Server</button>";
+  html += "<button class='tabbutton' onclick=\"openTab(event,'OTA')\">Firmware Update</button>";
+  html += "</div>";
+
+  // STA tab
+  html += "<div id='STA' class='tabcontent' style='display:block;'>";
+  html += "<div class='config-form'><h3>Current Status</h3>";
+  if (wifiSTAConnected) {
+    html += "<p><strong>Connected:</strong> " + sta_ssid + "</p>";
+    html += "<p><strong>IP:</strong> "  + WiFi.localIP().toString() + " | <strong>RSSI:</strong> " + String(WiFi.RSSI()) + " dBm</p>";
+  } else {
+    html += "<p>Not connected" + (sta_ssid.isEmpty() ? "" : " (last: "+sta_ssid+")") + "</p>";
+  }
+  html += "</div><form action='/save-sta' method='post' class='config-form'><h3>Connect to WiFi</h3>";
+  html += "<label>SSID:</label><input type='text' name='sta_ssid' value='" + sta_ssid + "' required>";
+  html += generatePasswordField("sta_password", sta_password, "Password");
+  html += "<div style='text-align:center;'><input type='submit' value='Save &amp; Connect' class='button'></div>";
+  html += "</form></div>";
+
+  // AP tab
+  html += "<div id='AP' class='tabcontent'><form action='/save-ap' method='post' class='config-form'>";
+  html += "<h3>Access Point</h3>";
+  html += "<p>SSID: <strong>" + String(ap_ssid) + "</strong> (fixed)</p>";
+  html += "<p>IP: <strong>" + WiFi.softAPIP().toString() + "</strong></p>";
+  html += generatePasswordField("ap_password", ap_pass, "AP Password (min 8 chars)");
+  html += "<input type='submit' value='Save AP Password' class='button'>";
+  html += "</form></div>";
+
+  // Server tab
+  html += "<div id='SERVER' class='tabcontent'><form action='/save-server' method='post' class='config-form'>";
+  html += "<h3>Server Configuration</h3>";
+  html += "<label>Host:</label><input type='text' name='server_host' value='" + serverHost + "' required placeholder='www.example.org'>";
+  html += "<label>Path:</label><input type='text' name='server_path' value='" + serverPath + "' required placeholder='/report_data/data.php'>";
+  html += "<label>Port:</label><input type='number' name='server_port' value='" + String(serverPort==0?80:serverPort) + "' min='1' max='65535' required>";
+  html += "<p><small>80 = HTTP &nbsp;|&nbsp; 443 = HTTPS</small></p>";
+  html += "<label>Upload Interval (seconds):</label><input type='number' name='update_interval' value='" + String(serverUpdateInterval/1000) + "' min='5' max='86400' required>";
+  html += "<div style='background:#f8e8f8;padding:10px;margin:10px 0;border-radius:5px;'>";
+  html += "<p><strong>Current:</strong> " + (serverHost.isEmpty() ? "Not set" : serverHost+":"+String(serverPort)+serverPath) + "</p>";
+  html += "<p><strong>Interval:</strong> " + String(serverUpdateInterval/1000) + "s</p></div>";
+  html += "<div style='text-align:center;'><input type='submit' value='Save Server Config' class='button server'></div>";
+  html += "</form></div>";
+
+  // OTA tab
+  html += "<div id='OTA' class='tabcontent'><div style='text-align:center;margin:20px;'>";
+  html += "<h3>Firmware Update</h3>";
+  html += "<p>Current: <strong>v" FIRMWARE_VERSION "</strong> | Device: <strong>" DEVICE_ID "</strong></p>";
+  html += "<a href='/ota-update' class='button danger'>Upload New Firmware</a>";
+  html += "<div class='status info' style='margin-top:20px;'><p>Only upload official .bin files for this device.</p></div>";
+  html += "</div></div>";
+
+  html += "<p><a href='/' class='button'>Back to Dashboard</a></p>";
+  html += "</body></html>";
+  server.send(200, "text/html", html);
+}
+
+void handleSaveSTA() {
+  if (server.hasArg("sta_ssid") && server.arg("sta_ssid").length() > 0) {
+    saveWiFiCredentials(server.arg("sta_ssid"), server.arg("sta_password"), "");
+    WiFi.disconnect(); delay(500); initializeWiFi();
+    server.sendHeader("Location", "/wifi-config?sta_saved=1"); server.send(303); return;
+  }
+  server.sendHeader("Location", "/wifi-config"); server.send(303);
+}
+
+void handleSaveAP() {
+  if (server.hasArg("ap_password")) {
+    String np = server.arg("ap_password");
+    if (np.length() >= 8) {
+      saveWiFiCredentials("", "", np);
+      ap_pass = np;
+      WiFi.softAPdisconnect(true); delay(300);
+      WiFi.softAP(ap_ssid, ap_pass.c_str());
+      server.sendHeader("Location", "/wifi-config?ap_saved=1"); server.send(303); return;
+    }
+  }
+  server.sendHeader("Location", "/wifi-config"); server.send(303);
+}
+
+void handleSaveServer() {
+  if (server.hasArg("server_host") && server.hasArg("server_path") &&
+      server.hasArg("server_port") && server.hasArg("update_interval")) {
+    String h  = server.arg("server_host");
+    String p  = server.arg("server_path");
+    int    pt = server.arg("server_port").toInt();
+    unsigned long iv = server.arg("update_interval").toInt() * 1000UL;
+    if (h.length()>0 && p.charAt(0)=='/' && pt>0 && pt<=65535 && iv>=5000 && iv<=86400000) {
+      saveServerConfig(h, p, pt, iv);
+      server.sendHeader("Location", "/wifi-config?server_saved=1"); server.send(303); return;
+    }
+  }
+  server.sendHeader("Location", "/wifi-config"); server.send(303);
+}
+
+// ── OTA page (transplanted 1:1 from example, updated for KA-LIDO) ──
+void handleOTAUpdate() {
+  String html = "<!DOCTYPE html><html><head>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<title>Firmware Update – KA-LIDO</title>";
+  html += "<style>body{font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px;}";
+  html += ".update-form{background:#f0f0f0;padding:20px;margin:20px 0;border-radius:8px;}";
+  html += ".button{background-color:#4CAF50;color:white;padding:10px 20px;border:none;border-radius:4px;cursor:pointer;margin:5px;}";
+  html += ".button.danger{background-color:#f44336;}";
+  html += ".status{padding:10px;margin:10px 0;border-radius:4px;}.warning{background:#fcf8e3;color:#8a6d3b;}.info{background:#d9edf7;color:#31708f;}";
+  html += "#progress{width:100%;height:30px;background:#f0f0f0;border-radius:5px;overflow:hidden;margin:10px 0;}";
+  html += "#progress-bar{height:100%;background:#4CAF50;width:0%;transition:width 0.3s;text-align:center;line-height:30px;color:white;}</style>";
+
+  // JavaScript — exactly from the example (field name 'file', posts to /ota-upload)
+  html += "<script>";
+  html += "function uploadFirmware(){";
+  html += "  var file=document.getElementById('firmware').files[0];";
+  html += "  if(!file){alert('Please select a firmware file');return;}";
+  html += "  if(!file.name.endsWith('.bin')){alert('Please select a .bin file');return;}";
+  html += "  if(!confirm('Update firmware? Device will restart.'))return;";
+  html += "  var formData=new FormData();";
+  html += "  formData.append('file',file);";
+  html += "  var xhr=new XMLHttpRequest();";
+  html += "  document.getElementById('status').innerHTML='Uploading...';";
+  html += "  document.getElementById('progress').style.display='block';";
+  html += "  xhr.upload.addEventListener('progress',function(e){";
+  html += "    if(e.lengthComputable){";
+  html += "      var pct=(e.loaded/e.total)*100;";
+  html += "      document.getElementById('progress-bar').style.width=pct+'%';";
+  html += "      document.getElementById('progress-bar').innerHTML=Math.round(pct)+'%';";
+  html += "    }";
+  html += "  });";
+  html += "  xhr.addEventListener('load',function(){";
+  html += "    if(xhr.status===200){";
+  html += "      document.getElementById('status').innerHTML='Update successful! Device restarting...';";
+  html += "      document.getElementById('status').className='status info';";
+  html += "      setTimeout(function(){window.location.href='/';},10000);";
+  html += "    }else{";
+  html += "      document.getElementById('status').innerHTML='Update failed: '+xhr.responseText;";
+  html += "      document.getElementById('status').className='status warning';";
+  html += "    }";
+  html += "  });";
+  html += "  xhr.addEventListener('error',function(){";
+  html += "    document.getElementById('status').innerHTML='Upload error occurred';";
+  html += "    document.getElementById('status').className='status warning';";
+  html += "  });";
+  html += "  xhr.open('POST','/ota-upload');";
+  html += "  xhr.send(formData);";
+  html += "}";
+  html += "</script></head><body>";
+
+  html += "<h1>Firmware Update</h1>";
+  html += "<div class='status warning'><strong>Warning:</strong><br>Only upload firmware from Sinau Bumi Technician.<br>Do not disconnect power during update.</div>";
+  html += "<div class='update-form'><h3>Current Firmware</h3>";
+  html += "<p><strong>Device ID:</strong> " DEVICE_ID "</p>";
+  html += "<p><strong>Firmware:</strong> "  FIRMWARE_NAME "</p>";
+  html += "<p><strong>Version:</strong> "   FIRMWARE_VERSION "</p>";
+  html += "<p><strong>SDK:</strong> " + String(ESP.getSdkVersion()) + "</p></div>";
+  html += "<div class='update-form'><h3>Upload New Firmware</h3>";
+  html += "<input type='file' id='firmware' accept='.bin' style='margin:10px 0;'><br>";
+  html += "<button onclick='uploadFirmware()' class='button danger'>Upload &amp; Update</button>";
+  html += "<div id='progress' style='display:none;'><div id='progress-bar'>0%</div></div>";
+  html += "<div id='status' class='status info' style='margin-top:10px;'>Select a .bin file and click Upload &amp; Update</div>";
+  html += "</div>";
+  html += "<p><a href='/' class='button'>Return to Dashboard</a></p>";
+  html += "</body></html>";
+  server.send(200, "text/html", html);
+}
+
+// ── OTA upload handler (transplanted 1:1 from example) ───────────
+void handleOTAUpload() {
+  HTTPUpload& upload = server.upload();
+
+  if (upload.status == UPLOAD_FILE_START) {
+    Serial.println("========================================");
+    Serial.printf("OTA Update Start: %s\n", upload.filename.c_str());
+    Serial.println("========================================");
+
+    // Show progress on TFT
+    tft.fillScreen(TFT_BLACK);
+    tft.fillRect(0, 0, tft.width(), 35, TFT_NAVY);
+    tft.setTextColor(TFT_YELLOW); tft.setTextSize(2);
+    tft.setCursor(8, 10); tft.print("OTA FIRMWARE UPDATE");
+    tft.setTextColor(TFT_WHITE); tft.setTextSize(1);
+    tft.setCursor(8, 50); tft.print("File: " + upload.filename);
+    tft.setCursor(8, 65); tft.print("Flashing – do not power off!");
+
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN))
+      Update.printError(Serial);
+  }
+  else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+      Update.printError(Serial);
+    } else {
+      // Progress bar on TFT
+      if (Update.size() > 0) {
+        int pct = (Update.progress() * 100) / Update.size();
+        int barW = (tft.width()-20) * pct / 100;
+        tft.fillRect(10, 85, tft.width()-20, 18, TFT_DARKGREY);
+        tft.fillRect(10, 85, barW,           18, TFT_BLUE);
+        tft.setCursor(10, 108); tft.setTextColor(TFT_WHITE); tft.setTextSize(1);
+        tft.print("Progress: "); tft.print(pct); tft.print("%   ");
+        Serial.printf("Progress: %d%%\r", pct);
+      } else {
+        Serial.printf("Written: %u bytes\r", Update.progress());
+      }
+    }
+  }
+  else if (upload.status == UPLOAD_FILE_END) {
+    if (Update.end(true)) {
+      Serial.printf("\nOTA Success: %u bytes written\n", upload.totalSize);
+      Serial.println("Rebooting...");
+      Serial.println("========================================");
+      tft.fillRect(0, 130, tft.width(), 30, TFT_BLACK);
+      tft.setCursor(8, 135); tft.setTextColor(TFT_GREEN); tft.setTextSize(2);
+      tft.print("Flash OK! Rebooting...");
+      delay(500);
+      ESP.restart();
+    } else {
+      Update.printError(Serial);
+      tft.setCursor(8, 130); tft.setTextColor(TFT_RED); tft.setTextSize(1);
+      tft.print("OTA FAILED: "); tft.print(Update.errorString());
+    }
+  }
+}
+//  BOD / COD
+float calculateCOD(float bod, float temperature) {
+  return 0.1011f + (6.7610f * bod) - (0.0204f * temperature);
+}
+
+void calculateBOD() {
+  if (!sensorData.isValid || sensorData.do_level <= 0) return;
+  if (sensorData.firstMeasurementTime == 0) {
+    sensorData.firstMeasurementTime = millis();
+    Serial.println("First DO measurement – BOD/COD in 10 min."); return;
+  }
+  if ((millis()-sensorData.firstMeasurementTime) < 600000) {
+    Serial.println("BOD/COD: " + String((600000-(millis()-sensorData.firstMeasurementTime))/1000) + "s remaining"); return;
+  }
+  lastBODCalculationTime = millis();
+  float currentDO = sensorData.do_level;
+  float temp = sensorData.temperature > 0 ? sensorData.temperature : 25.0f;
+  sensorData.do_saturation = 14.259f * exp(-0.022f * temp);
+  sensorData.k = 0.4f;
+  float deficit = max(sensorData.do_saturation - currentDO, 0.0f);
+  sensorData.bod1 = constrain(deficit / sensorData.k,            0.0f, 9999.0f);
+  sensorData.bod5 = constrain(sensorData.bod1 * 1.5f,            0.0f, 9999.0f);
+  sensorData.cod  = constrain(calculateCOD(sensorData.bod5,temp), 0.0f, 9999.0f);
+  bodCalculated = true;
+  Serial.printf("BOD/COD: T=%.1f DO=%.2f sat=%.2f BOD1=%.2f BOD5=%.2f COD=%.2f\n",
+                temp, currentDO, sensorData.do_saturation,
+                sensorData.bod1, sensorData.bod5, sensorData.cod);
+}
+
+//  CRC / packet helpers
+uint16_t calculateCRC16(uint8_t *data, size_t length) {
+  uint16_t crc = 0xFFFF;
+  for (size_t i = 0; i < length; i++) {
+    crc ^= (uint16_t)data[i];
+    for (uint8_t j = 0; j < 8; j++) crc = (crc&1) ? ((crc>>1)^0xA001) : (crc>>1);
+  }
+  return crc;
+}
+
+void printPacketHex(uint8_t *packet, int length) {
+  Serial.println("Packet (hex):");
+  for (int i = 0; i < length; i++) {
+    if (packet[i] < 0x10) Serial.print("0");
+    Serial.print(packet[i], HEX); Serial.print(" ");
+    if ((i+1)%8==0) Serial.println();
+  }
+  Serial.println();
+}
+
+void flashReceivedIndicator(int x, int y, uint16_t color) {
+  tft.fillCircle(x, y, 5, color); delay(50); tft.fillCircle(x, y, 5, BACKGROUND);
+}
+
+//  LoRa packet processing — single 26-byte float packet
+void processPacket(int packetSize, int rssi) {
+  if (packetSize != 26) {
+    // drain buffer and log unknown size
+    while (LoRa.available()) LoRa.read();
+    Serial.printf("Unknown packet size: %d bytes\n", packetSize);
+    return;
+  }
+  uint8_t p[26];
+  for (int i = 0; i < 26; i++) p[i] = LoRa.read();
+  if (DEBUG_PACKET_DATA) printPacketHex(p, 26);
+
+  // CRC covers bytes [0..23]; TX stores it as low byte first at [24..(not here)]
+  // Per TX layout: [24]=DeviceID, [25]=Seq — CRC not transmitted separately
+  // CRC covers [0..23] per TX code; verify only the data region
+  // NOTE: TX calculateCRC16 uses same polynomial — verify first 24 bytes
+  // The TX does NOT append a separate CRC field; [24] and [25] are DeviceID+Seq
+  // So we can only do a soft sanity check on values (no CRC byte available)
+
+  // Unpack floats via memcpy (matches TX memcpy packing)
+  float rxPH, rxEC, rxDO, rxTDS, rxTemp, rxDepth;
+  memcpy(&rxPH,    &p[0],  4);
+  memcpy(&rxEC,    &p[4],  4);
+  memcpy(&rxDO,    &p[8],  4);
+  memcpy(&rxTDS,   &p[12], 4);
+  memcpy(&rxTemp,  &p[16], 4);
+  memcpy(&rxDepth, &p[20], 4);
+
+  uint8_t rxDeviceId = p[24];
+  uint8_t rxSeq      = p[25];
+
+  // Sanity check — reject NaN or physically impossible values
+  if (isnan(rxPH)    || rxPH    < 0   || rxPH    > 14)   { crcErrors++; Serial.println("Bad pH");    return; }
+  if (isnan(rxEC)    || rxEC    < 0   || rxEC    > 200)   { crcErrors++; Serial.println("Bad EC");    return; }
+  if (isnan(rxDO)    || rxDO    < 0   || rxDO    > 20)    { crcErrors++; Serial.println("Bad DO");    return; }
+  if (isnan(rxTDS)   || rxTDS   < 0   || rxTDS   > 5000)  { crcErrors++; Serial.println("Bad TDS");   return; }
+  if (isnan(rxTemp)  || rxTemp  < -10 || rxTemp  > 60)    { crcErrors++; Serial.println("Bad Temp");  return; }
+  if (isnan(rxDepth) || rxDepth < 0   || rxDepth > 1000)  { crcErrors++; Serial.println("Bad Depth"); return; }
+
+  // Detect missed packets
+  static uint8_t lastSeq = 255;
+  if (lastSeq != 255 && rxSeq != (uint8_t)(lastSeq + 1))
+    Serial.println("Missed " + String((uint8_t)(rxSeq - lastSeq - 1)) + " packet(s)");
+  lastSeq = rxSeq;
+
+  sensorData.pH          = rxPH;
+  sensorData.ec          = rxEC * 1000.0f;   // mS/cm → µS/cm
+  sensorData.do_level    = rxDO;
+  sensorData.tds         = rxTDS;
+  sensorData.temperature = rxTemp;
+  sensorData.depth       = rxDepth;
+  sensorData.deviceId    = rxDeviceId;
+  sensorData.sequence    = rxSeq;
+  sensorData.rssi        = rssi;
+  sensorData.timestamp   = millis();
+  sensorData.isValid     = true;
+
+  if (sensorData.firstMeasurementTime == 0) sensorData.firstMeasurementTime = millis();
+
+  lastDataTime = millis();
+  receivedPacketsTotal++;
+
+  Serial.printf("RX: ID=%d Seq=%d pH=%.2f EC=%.2fmS DO=%.2f TDS=%.0f T=%.1f D=%.1fcm RSSI=%d\n",
+                rxDeviceId, rxSeq, rxPH, rxEC, rxDO, rxTDS, rxTemp, rxDepth, rssi);
+}
+
+void checkForPacketsWithTimeout() {
+  unsigned long t = millis();
+  int sz = LoRa.parsePacket();
+  while (sz == 0 && millis()-t < 500) { sz = LoRa.parsePacket(); delay(1); }
+  if (sz > 0) {
+    int rssi = LoRa.packetRssi();
+    Serial.printf("\n=== LoRa RX: %d bytes RSSI=%d ===\n", sz, rssi);
+    processPacket(sz, rssi);
+    flashReceivedIndicator(tft.width()-10, 10, TFT_GREEN);
+    updateDisplay();
+    LoRa.receive();
+  }
+}
+
+//  LoRa init / watchdog
+void configureLoRa() {
+  LoRa.setSpreadingFactor(8); LoRa.setSignalBandwidth(250E3);
+  LoRa.setCodingRate4(6); LoRa.setSyncWord(0xF1); LoRa.enableCrc(); LoRa.receive();
+  if (DEBUG_LORA) Serial.println("LoRa: SF8 BW250 CR4/6 CRC ON");
+}
+
+void checkLoRaStatus() {
+  if (!loraInitialized && (millis()-lastReceiveAttempt > RECEIVE_RETRY_INTERVAL)) {
+    pinMode(LORA_RST,OUTPUT); digitalWrite(LORA_RST,LOW); delay(20); digitalWrite(LORA_RST,HIGH); delay(50);
+    LoRaSPI.begin(LORA_SCK,LORA_MISO,LORA_MOSI,LORA_SS);
+    LoRa.setSPI(LoRaSPI); LoRa.setPins(LORA_SS,LORA_RST,LORA_DIO0);
+    unsigned long t=millis(); bool ok=false;
+    while(millis()-t<3000){if(LoRa.begin(915E6)){ok=true;break;}delay(100);}
+    if(ok){loraInitialized=true;configureLoRa();updateDisplay();}
+    lastReceiveAttempt=millis();
+  } else if (loraInitialized &&
+             (millis()-lastDataTime>30000) &&
+             (millis()-lastReceiveAttempt>RECEIVE_RETRY_INTERVAL)) {
+    LoRa.receive(); lastReceiveAttempt=millis();
+  }
+}
+
+//  Display
+void initializeDisplay() {
+  pinMode(TFT_BL,OUTPUT); digitalWrite(TFT_BL,HIGH);
+  DisplaySPI.begin(DISPLAY_SCK,DISPLAY_MISO,DISPLAY_MOSI,DISPLAY_CS);
+  tft.init(); tft.setRotation(1); tft.fillScreen(BACKGROUND);
+  Serial.println("Display initialized");
+}
+
+void initializeDisplayLayout() {
+  tft.fillScreen(BACKGROUND);
+  tft.fillRect(0,0,tft.width(),30,TFT_NAVY);
+  tft.setTextColor(TFT_YELLOW); tft.setTextSize(2);
+  tft.setCursor(5,10); tft.print("Water Quality Monitor");
+  tft.fillRect(0,30,tft.width(),15,TFT_DARKGREY);
+  tft.setTextSize(1);
+  tft.setCursor(5,  35); tft.setTextColor(TEXT_COLOR); tft.print("LoRa:");
+  tft.setCursor(120,35); tft.print("Uptime:");
+  tft.setCursor(220,35); tft.print("Pkts:");
+  tft.setCursor(300,35); tft.print("SRV:");
+  tft.fillRect(0,45,             tft.width(),20,TFT_NAVY);
+  tft.fillRect(0,tft.height()-20,tft.width(),20,TFT_NAVY);
+  tft.setTextColor(TEXT_COLOR); tft.setTextSize(1);
+  tft.setCursor(5,50); tft.print("NODE: pH  EC  DO  TDS  TEMP  DEPTH");
+  tft.setCursor(5,tft.height()-15); tft.print("AWQ-RX v" FIRMWARE_VERSION "  AP:" + String(ap_ssid) + " " + WiFi.softAPIP().toString());
+  layoutInitialized = true;
+}
+
+void updateSensorDisplay() {
+  tft.fillRect(0,65,tft.width(),tft.height()-85,TFT_BLACK);
+  if (!sensorData.isValid) {
+    tft.setTextColor(ERROR_COLOR); tft.setTextSize(1);
+    tft.setCursor(5,70); tft.print("OFFLINE – waiting for data"); return;
+  }
+  unsigned long age = (millis()-lastDataTime)/1000;
+  tft.setTextColor(VALUE_COLOR); tft.setTextSize(1); tft.setCursor(5,70);
+  tft.print("Online ("); tft.print(age); tft.print("s) RSSI:"); tft.print(sensorData.rssi);
+  tft.print("  ID:"); tft.print(sensorData.deviceId); tft.print(" Seq:"); tft.print(sensorData.sequence);
+
+  // Row 1: pH  EC  DO  TDS  TEMP
+  const int BW=75, BH=40, SP=5, R1=85, R2=R1+BH+15;
+  const int C1=5, C2=C1+BW+SP, C3=C2+BW+SP, C4=C3+BW+SP, C5=C4+BW+SP;
+  char v[10];
+  auto box = [&](int cx, int cy, const char* lbl, float val, uint16_t col, const char* unit) {
+    tft.setTextSize(1); tft.setTextColor(TEXT_COLOR); tft.setCursor(cx,cy); tft.print(lbl);
+    tft.drawRect(cx,cy+10,BW,BH,TFT_DARKGREY); tft.setTextSize(2); tft.setTextColor(col);
+    tft.setCursor(cx+4,cy+18); tft.print(val,1);
+    tft.setTextSize(1); tft.setTextColor(TEXT_COLOR); tft.setCursor(cx+4,cy+45); tft.print(unit);
+  };
+  box(C1,R1,"pH",   sensorData.pH,          PH_COLOR,  "units");
+  box(C2,R1,"EC",   sensorData.ec,           EC_COLOR,  "uS/cm");
+  box(C3,R1,"DO",   sensorData.do_level,     DO_COLOR,  "mg/L");
+  // TDS as integer
+  tft.setTextSize(1); tft.setTextColor(TEXT_COLOR); tft.setCursor(C4,R1); tft.print("TDS");
+  tft.drawRect(C4,R1+10,BW,BH,TFT_DARKGREY); tft.setTextSize(2); tft.setTextColor(TDS_COLOR);
+  tft.setCursor(C4+4,R1+18); tft.print((int)round(sensorData.tds));
+  tft.setTextSize(1); tft.setTextColor(TEXT_COLOR); tft.setCursor(C4+4,R1+45); tft.print("ppm");
+  box(C5,R1,"TEMP", sensorData.temperature,  TIME_COLOR,"°C");
+
+  // Row 2: BOD1  BOD5  COD  Depth  SIGNAL
+  auto bodBox = [&](int cx, int cy, const char* lbl, float val, bool avail, uint16_t col) {
+    tft.setTextSize(1); tft.setTextColor(TEXT_COLOR); tft.setCursor(cx,cy); tft.print(lbl);
+    tft.drawRect(cx,cy+10,BW,BH,TFT_DARKGREY);
+    tft.fillRect(cx+1,cy+11,BW-2,BH-2,BACKGROUND);
+    tft.setTextSize(2); tft.setTextColor(col); tft.setCursor(cx+4,cy+18);
+    sprintf(v,"%.1f",avail?val:0.0f); tft.print(v);
+    tft.setTextSize(1); tft.setTextColor(TEXT_COLOR); tft.setCursor(cx+4,cy+45); tft.print("mg/L");
+  };
+  bodBox(C1,R2,"BOD1",sensorData.bod1,bodCalculated,DO_COLOR);
+  bodBox(C2,R2,"BOD5",sensorData.bod5,bodCalculated,DO_COLOR);
+  bodBox(C3,R2,"COD", sensorData.cod, bodCalculated,COD_COLOR);
+
+  // Depth box
+  box(C4,R2,"DEPTH",sensorData.depth,TIME_COLOR,"cm");
+
+  // Signal bar
+  tft.setTextSize(1); tft.setTextColor(TEXT_COLOR); tft.setCursor(C5,R2); tft.print("SIGNAL");
+  tft.drawRect(C5,R2+10,BW,BH,TFT_DARKGREY);
+  int bl = map(constrain(sensorData.rssi,-120,-30),-120,-30,2,BW-4);
+  uint16_t bc = sensorData.rssi>-70 ? TFT_GREEN : (sensorData.rssi>-90 ? TFT_YELLOW : TFT_RED);
+  tft.fillRect(C5+2,R2+22,bl,8,bc);
+  tft.setCursor(C5+4,R2+34); tft.setTextColor(bc); tft.print(sensorData.rssi); tft.print("dBm");
+
+  // BOD pending message
+  tft.fillRect(0,R2+BH+12,tft.width(),12,TFT_BLACK);
+  if (!bodCalculated && sensorData.firstMeasurementTime>0) {
+    unsigned long el = (millis()-sensorData.firstMeasurementTime)/60000;
+    tft.setTextSize(1); tft.setTextColor(TIME_COLOR); tft.setCursor(C1,R2+BH+14);
+    tft.print("BOD/COD after 10 min ("); tft.print(el); tft.print("m elapsed)");
+  }
+}
+
+void updateDisplay() {
+  if (!layoutInitialized) initializeDisplayLayout();
+  tft.fillRect(45,35,60,10,TFT_DARKGREY); tft.setCursor(45,35);
+  tft.setTextColor(loraInitialized?TFT_GREEN:ERROR_COLOR);
+  tft.print(loraInitialized?"ONLINE":"OFFLINE");
+  tft.fillRect(165,35,40,10,TFT_DARKGREY); tft.setCursor(165,35);
+  tft.setTextColor(TIME_COLOR); tft.print(millis()/1000); tft.print("s");
+  tft.fillRect(255,35,35,10,TFT_DARKGREY); tft.setCursor(255,35);
+  tft.setTextColor(TIME_COLOR); tft.print(receivedPacketsTotal);
+  tft.fillRect(320,35,80,10,TFT_DARKGREY); tft.setCursor(320,35);
+  tft.setTextColor(serverConnected?VALUE_COLOR:(serverErrors>0?ERROR_COLOR:TEXT_COLOR));
+  tft.print(serverUploads>0?(serverConnected?"OK":"ERR"):"---");
+  updateSensorDisplay();
+  tft.fillRect(0,tft.height()-35,tft.width(),15,TFT_BLACK);
+  tft.setCursor(5,tft.height()-30); tft.setTextSize(1);
+  if (timeInitialized) {
+    struct tm ti; if (getLocalTime(&ti)) {
+      tft.setTextColor(VALUE_COLOR); tft.print("Time: "); tft.print(&ti,"%Y-%m-%d %H:%M:%S");
+    }
+  } else {
+    tft.setTextColor(TEXT_COLOR); tft.print("AP: "); tft.print(ap_ssid);
+    tft.print(" @ "); tft.print(WiFi.softAPIP().toString());
+  }
+  tft.fillRect(5,tft.height()-15,tft.width()-10,10,TFT_NAVY);
+  tft.setCursor(5,tft.height()-15); tft.setTextColor(TIME_COLOR); tft.setTextSize(1);
+  getFormattedTimestamp(timeStampBuf,sizeof(timeStampBuf));
+  tft.print(timeStampBuf); tft.print("  Upload: ");
+  if (lastServerSend>0){tft.print((millis()-lastServerSend)/1000); tft.print("s ago");}
+  else tft.print("Never");
+}
+
+//  Setup
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("\n========================================");
+  Serial.println("KA-LIDO Water Quality Monitor");
+  Serial.println("Firmware : " FIRMWARE_NAME "  v" FIRMWARE_VERSION);
+  Serial.println("Author   : " FIRMWARE_AUTHOR);
+  Serial.println("Build    : " __DATE__ " " __TIME__);
+  Serial.println("========================================");
+
+  startupTime = millis();
+
+  EEPROM.begin(EEPROM_SIZE);
+  readAPPassword();
+  readWiFiCredentials();
+  readServerConfig();
+
+  initializeDisplay();
+  initializeDisplayLayout();
+
+  // LoRa
+  Serial.print("LoRa init... ");
+  pinMode(LORA_RST,OUTPUT);
+  digitalWrite(LORA_RST,LOW); delay(20); digitalWrite(LORA_RST,HIGH); delay(50);
+  LoRaSPI.begin(LORA_SCK,LORA_MISO,LORA_MOSI,LORA_SS);
+  LoRa.setSPI(LoRaSPI); LoRa.setPins(LORA_SS,LORA_RST,LORA_DIO0);
+  unsigned long lt=millis();
+  while(millis()-lt<5000){if(LoRa.begin(915E6)){loraInitialized=true;break;}Serial.print(".");delay(200);}
+  if(loraInitialized){Serial.println("OK!"); configureLoRa();}
+  else Serial.println("FAILED – will retry.");
+  lastReceiveAttempt=millis();
+
+  // WiFi (AP always on, STA if credentials saved)
+  initializeWiFi();
+
+  // Register web server routes — exactly the same pattern as example code
+  server.on("/",           HTTP_GET,  handleRoot);
+  server.on("/readings",   HTTP_GET,  handleReadings);
+  server.on("/wifi-config",HTTP_GET,  handleWiFiConfig);
+  server.on("/save-sta",   HTTP_POST, handleSaveSTA);
+  server.on("/save-ap",    HTTP_POST, handleSaveAP);
+  server.on("/save-server",HTTP_POST, handleSaveServer);
+  server.on("/ota-update", HTTP_GET,  handleOTAUpdate);
+  server.on("/ota-upload", HTTP_POST,
+    []() { /* handleOTAUpload calls ESP.restart() on success */ },
+    handleOTAUpload
+  );
+
+  server.begin();
+  Serial.println("Web server started.");
+  Serial.println("Dashboard : http://" + WiFi.softAPIP().toString() + "/");
+  Serial.println("OTA       : http://" + WiFi.softAPIP().toString() + "/ota-update");
+  Serial.println("========================================");
+
+  updateDisplay();
+  Serial.println("=== SYSTEM READY ===");
+}
+
+//  Loop
+void loop() {
+  server.handleClient();     // ← must be first / every iteration
+  checkWiFiConnection();
+  checkLoRaStatus();
+  checkForPacketsWithTimeout();
+
+  // BOD/COD recalculation
+  if (sensorData.isValid && sensorData.firstMeasurementTime>0 &&
+      (millis()-sensorData.firstMeasurementTime)>=600000 &&
+      (millis()-lastBODCalculationTime>BOD_UPDATE_INTERVAL)) calculateBOD();
+
+  // Server upload (interval controlled inside uploadToServer)
+  uploadToServer();
+
+  // NTP re-sync every 24 h
+  if (wifiSTAConnected && (millis()-lastTimeSync>86400000)) initializeTime();
+
+  // Display refresh
+  static unsigned long lastDisp=0;
+  if (millis()-lastDisp>DISPLAY_UPDATE_INTERVAL){ updateDisplay(); lastDisp=millis(); }
+
+  // Debug heartbeat
+  static unsigned long lastDbg=0;
+  if (millis()-lastDbg>DEBUG_MSG_INTERVAL) {
+    Serial.printf("\n--- Status [%lus] ---\n", (millis()-startupTime)/1000);
+    Serial.printf("LoRa:%s  WiFi:%s  AP:%s\n",
+                  loraInitialized?"ON":"OFF",
+                  wifiSTAConnected?"STA+AP":"AP only",
+                  WiFi.softAPIP().toString().c_str());
+    Serial.printf("Server: %s  uploads=%lu  errors=%lu\n",
+                  lastServerStatus.c_str(), serverUploads, serverErrors);
+    Serial.printf("Pkts: total=%lu  CRC err=%lu\n",
+                  receivedPacketsTotal, crcErrors);
+    if (loraInitialized) LoRa.receive();
+    lastDbg=millis();
+  }
+
+  delay(10);
+}
